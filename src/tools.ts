@@ -325,9 +325,21 @@ interface CodListResponse<T> {
  * sufficient and avoids timezone surprises.
  */
 function toUtcStamp(s: string): string {
-  // Accept either ISO ("2026-05-01T00:00:00Z") or "YYYY-MM-DD" or
-  // "YYYY-MM-DD HH:MM:SS". Normalise to "YYYY-MM-DD HH:MM:SS".
-  const date = new Date(s.length === 10 ? `${s}T00:00:00Z` : s);
+  // Accept "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS" (treated as UTC per the schema
+  // contract), or any ISO-8601 string with explicit zone. `new Date(...)` would
+  // otherwise parse the space-separated form as **local** time, silently
+  // shifting the range on non-UTC hosts.
+  const trimmed = s.trim();
+  let toParse: string;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    toParse = `${trimmed}T00:00:00Z`;
+  } else if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    toParse = `${trimmed.replace(" ", "T")}Z`;
+  } else {
+    // Already has a zone, fractional seconds, etc. Trust the input.
+    toParse = trimmed;
+  }
+  const date = new Date(toParse);
   if (Number.isNaN(date.getTime())) {
     throw new Error(`Invalid date string: ${s}`);
   }
