@@ -24,6 +24,11 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import {
+  InvalidGrantError,
+  InvalidRequestError,
+  InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
 const ACCESS_TTL_SEC = 3600; // 1 hour
 const REFRESH_TTL_SEC = 30 * 24 * 3600; // 30 days
@@ -124,7 +129,7 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
     res: Response,
   ): Promise<void> {
     if (!client.redirect_uris.includes(params.redirectUri)) {
-      throw new Error("Unregistered redirect_uri");
+      throw new InvalidRequestError("Unregistered redirect_uri");
     }
 
     this.gcExpired();
@@ -187,7 +192,7 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<string> {
     const rec = this.codes.get(authorizationCode);
-    if (!rec) throw new Error("Invalid authorization code");
+    if (!rec) throw new InvalidGrantError("Invalid authorization code");
     return rec.params.codeChallenge;
   }
 
@@ -196,13 +201,15 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
     authorizationCode: string,
   ): Promise<OAuthTokens> {
     const rec = this.codes.get(authorizationCode);
-    if (!rec) throw new Error("Invalid authorization code");
+    if (!rec) throw new InvalidGrantError("Invalid authorization code");
     if (rec.expiresAt < Date.now()) {
       this.codes.delete(authorizationCode);
-      throw new Error("Authorization code expired");
+      throw new InvalidGrantError("Authorization code expired");
     }
     if (rec.client.client_id !== client.client_id) {
-      throw new Error("Authorization code was not issued to this client");
+      throw new InvalidGrantError(
+        "Authorization code was not issued to this client",
+      );
     }
     this.codes.delete(authorizationCode);
 
@@ -221,11 +228,11 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const rec = this.tokens.get(refreshToken);
     if (!rec || rec.type !== "refresh" || rec.clientId !== client.client_id) {
-      throw new Error("Invalid refresh token");
+      throw new InvalidGrantError("Invalid refresh token");
     }
     if (rec.expiresAt < Date.now()) {
       this.tokens.delete(refreshToken);
-      throw new Error("Refresh token expired");
+      throw new InvalidGrantError("Refresh token expired");
     }
     return this.issueTokens(
       client.client_id,
@@ -237,7 +244,7 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const rec = this.tokens.get(token);
     if (!rec || rec.type !== "access" || rec.expiresAt < Date.now()) {
-      throw new Error("Invalid or expired token");
+      throw new InvalidTokenError("Invalid or expired token");
     }
     return {
       token,
