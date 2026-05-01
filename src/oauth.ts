@@ -234,6 +234,11 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
       this.tokens.delete(refreshToken);
       throw new InvalidGrantError("Refresh token expired");
     }
+    // OAuth 2.1 refresh-token rotation: consume this refresh token so it can't
+    // be replayed. Also opportunistically GC expired records since the map
+    // would otherwise only get cleaned up during fresh authorize() calls.
+    this.tokens.delete(refreshToken);
+    this.gcExpired();
     return this.issueTokens(
       client.client_id,
       scopes ?? rec.scopes,
