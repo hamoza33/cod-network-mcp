@@ -285,6 +285,214 @@ const listSourceRequests = tool({
 });
 
 /* -------------------------------------------------------------------------- */
+/*  Aggregation: one-shot summaries that paginate internally                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Maximum number of API pages we'll page through for a single summary call.
+ * 200 pages * 10 per_page = 20,000 rows. Anything beyond that we'd want to
+ * stream, not buffer. The vast majority of date-bounded questions resolve in
+ * 1-5 pages.
+ */
+const SUMMARY_MAX_PAGES = 200;
+
+interface CodOrder {
+  id: number;
+  status?: { label?: string; code?: number };
+  customer_country_name?: string;
+  currency?: string;
+  total?: number;
+  total_usd?: number;
+  delivered_at?: string | null;
+  returned_at?: string | null;
+  created_at?: string;
+}
+
+interface CodLead {
+  id: number;
+  status?: { label?: string; code?: number };
+  created_at?: string;
+}
+
+interface CodListResponse<T> {
+  data: T[];
+  meta?: { pagination?: { total?: number; current_page?: number; total_pages?: number } };
+}
+
+/**
+ * Treat `since` / `until` as plain `YYYY-MM-DD HH:MM:SS` UTC strings. The COD
+ * API serialises `created_at` as exactly that format, so string comparison is
+ * sufficient and avoids timezone surprises.
+ */
+function toUtcStamp(s: string): string {
+  // Accept either ISO ("2026-05-01T00:00:00Z") or "YYYY-MM-DD" or
+  // "YYYY-MM-DD HH:MM:SS". Normalise to "YYYY-MM-DD HH:MM:SS".
+  const date = new Date(s.length === 10 ? `${s}T00:00:00Z` : s);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid date string: ${s}`);
+  }
+  return date.toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+}
+
+async function paginateInRange<T extends { created_at?: string }>(
+  client: CodClient,
+  path: string,
+  since: string,
+  until: string,
+  query: Record<string, string | number | boolean | string[]>,
+): Promise<{ items: T[]; pagesScanned: number; reachedCutoff: boolean }> {
+  const items: T[] = [];
+  let page = 1;
+  let reachedCutoff = false;
+  while (page <= SUMMARY_MAX_PAGES) {
+    const resp = await client.request<CodListResponse<T>>({
+      path,
+      query: { ...query, page, per_page: 10, sort: "-created_at" },
+    });
+    const batch = resp.data ?? [];
+    if (batch.length === 0) break;
+    for (const row of batch) {
+      const ts = row.created_at ?? "";
+      if (ts >= until) continue;
+      if (ts < since) {
+        reachedCutoff = true;
+        break;
+      }
+      items.push(row);
+    }
+    // Newest first means once we cross `since` we're done.
+    if (reachedCutoff) break;
+    // Defensive stop if API runs out.
+    const meta = resp.meta?.pagination;
+    if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
+    page += 1;
+  }
+  return { items, pagesScanned: page, reachedCutoff };
+}
+
+function bucketBy<T>(rows: T[], key: (r: T) => string | undefined): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const r of rows) {
+    const k = key(r) ?? "(unknown)";
+    out[k] = (out[k] ?? 0) + 1;
+  }
+  return out;
+}
+
+const summarizePeriod = tool({
+  name: "cod_summarize_period",
+  description:
+    "One-shot summary of leads + orders within a date range. Paginates the COD API internally and returns aggregate counts by status and country, revenue per currency, and confirmation/delivery rates — without you having to scroll through pages of raw rows. Prefer this for any 'today', 'last week', 'this month' style question.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .describe(
+        "Start of range, inclusive. Accepts `YYYY-MM-DD` (interpreted as 00:00 UTC) or full `YYYY-MM-DD HH:MM:SS` UTC.",
+      ),
+    until: z
+      .string()
+      .optional()
+      .describe(
+        "End of range, exclusive. Same formats as `since`. Defaults to the current time.",
+      ),
+    include_orders: z.boolean().optional().default(true),
+    include_leads: z.boolean().optional().default(true),
+    include_examples: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "If true, include lists of `order_ids` and `lead_ids` (capped at 50 each) so you can drill down with `cod_get_order` / `cod_get_lead`.",
+      ),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since);
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+    if (since >= until) {
+      throw new Error(`Empty range: since (${since}) >= until (${until})`);
+    }
+
+    const wantOrders = input.include_orders !== false;
+    const wantLeads = input.include_leads !== false;
+
+    const [ordersResult, leadsResult] = await Promise.all([
+      wantOrders
+        ? paginateInRange<CodOrder>(client, "/seller/orders", since, until, {})
+        : Promise.resolve({ items: [], pagesScanned: 0, reachedCutoff: true }),
+      wantLeads
+        ? paginateInRange<CodLead>(client, "/seller/leads", since, until, {})
+        : Promise.resolve({ items: [], pagesScanned: 0, reachedCutoff: true }),
+    ]);
+
+    const ordersByStatus = bucketBy(ordersResult.items, (o) => o.status?.label);
+    const ordersByCountry = bucketBy(ordersResult.items, (o) => o.customer_country_name);
+    const revenueByCurrency: Record<string, number> = {};
+    let revenueUsd = 0;
+    for (const o of ordersResult.items) {
+      const cur = o.currency ?? "(unknown)";
+      revenueByCurrency[cur] = (revenueByCurrency[cur] ?? 0) + (o.total ?? 0);
+      revenueUsd += o.total_usd ?? 0;
+    }
+
+    const delivered = ordersResult.items.filter((o) => o.delivered_at).length;
+    const returned = ordersResult.items.filter((o) => o.returned_at).length;
+
+    const leadsByStatus = bucketBy(leadsResult.items, (l) => l.status?.label);
+    const confirmedLeads = leadsResult.items.filter(
+      (l) => (l.status?.label ?? "").toLowerCase() === "confirmed",
+    ).length;
+
+    const round = (n: number, dp = 2): number =>
+      Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp);
+
+    const summary: Record<string, unknown> = {
+      range: { since, until },
+      orders: wantOrders
+        ? {
+            count: ordersResult.items.length,
+            by_status: ordersByStatus,
+            by_country: ordersByCountry,
+            revenue_by_currency: Object.fromEntries(
+              Object.entries(revenueByCurrency).map(([k, v]) => [k, round(v)]),
+            ),
+            revenue_usd_estimate: round(revenueUsd),
+            delivered_count: delivered,
+            returned_count: returned,
+            delivery_rate_pct:
+              ordersResult.items.length > 0
+                ? round((delivered / ordersResult.items.length) * 100, 1)
+                : 0,
+            pages_scanned: ordersResult.pagesScanned,
+            full_range_covered: ordersResult.reachedCutoff,
+          }
+        : undefined,
+      leads: wantLeads
+        ? {
+            count: leadsResult.items.length,
+            by_status: leadsByStatus,
+            confirmed_count: confirmedLeads,
+            confirmation_rate_pct:
+              leadsResult.items.length > 0
+                ? round((confirmedLeads / leadsResult.items.length) * 100, 1)
+                : 0,
+            pages_scanned: leadsResult.pagesScanned,
+            full_range_covered: leadsResult.reachedCutoff,
+          }
+        : undefined,
+    };
+
+    if (input.include_examples) {
+      summary.examples = {
+        order_ids: ordersResult.items.slice(0, 50).map((o) => o.id),
+        lead_ids: leadsResult.items.slice(0, 50).map((l) => l.id),
+      };
+    }
+
+    return summary;
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /*  Escape hatch                                                              */
 /*                                                                            */
 /*  The docs site (developer.cod.network/v2) lists pages for                  */
@@ -338,5 +546,6 @@ export const tools: ReadonlyArray<ToolDef> = [
   listInvoices,
   getInvoice,
   listSourceRequests,
+  summarizePeriod,
   rawRequest,
 ];
