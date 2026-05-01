@@ -6,10 +6,13 @@
  * (ChatGPT Desktop, Claude Desktop, Cursor, Continue, ...) can query a COD
  * Network seller account.
  *
- * Configuration via environment variables:
- *   COD_NETWORK_API_TOKEN  required, bearer token from the seller dashboard
+ * Configuration via environment variables (provide either a token, or
+ * email + password — the latter auto-refreshes on 401):
+ *   COD_NETWORK_API_TOKEN  bearer token from the seller dashboard
+ *   COD_NETWORK_EMAIL      seller account email (paired with COD_NETWORK_PASSWORD)
+ *   COD_NETWORK_PASSWORD   seller account password
  *   COD_NETWORK_BASE_URL   optional, defaults to https://api.cod.network/v2
- *   COD_NETWORK_TIMEOUT_MS optional, defaults to 30000
+ *   COD_NETWORK_TIMEOUT_MS optional positive integer, defaults to 30000
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -37,9 +40,19 @@ function readConfig() {
     process.exit(1);
   }
   const baseUrl = process.env.COD_NETWORK_BASE_URL;
-  const timeoutMs = process.env.COD_NETWORK_TIMEOUT_MS
-    ? Number.parseInt(process.env.COD_NETWORK_TIMEOUT_MS, 10)
-    : undefined;
+  let timeoutMs: number | undefined;
+  if (process.env.COD_NETWORK_TIMEOUT_MS) {
+    const parsed = Number.parseInt(process.env.COD_NETWORK_TIMEOUT_MS, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      process.stderr.write(
+        `[cod-network-mcp] WARN: ignoring invalid COD_NETWORK_TIMEOUT_MS=${JSON.stringify(
+          process.env.COD_NETWORK_TIMEOUT_MS,
+        )}; expected a positive integer.\n`,
+      );
+    } else {
+      timeoutMs = parsed;
+    }
+  }
   return { token, email, password, baseUrl, timeoutMs };
 }
 
