@@ -379,7 +379,9 @@ async function paginateInRange<T extends { created_at?: string }>(
     if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
     page += 1;
   }
-  return { items, pagesScanned: page, reachedCutoff };
+  // `page` is already incremented past the last fetched page when the loop
+  // hits SUMMARY_MAX_PAGES; clamp so the count reflects actual API calls.
+  return { items, pagesScanned: Math.min(page, SUMMARY_MAX_PAGES), reachedCutoff };
 }
 
 function bucketBy<T>(rows: T[], key: (r: T) => string | undefined): Record<string, number> {
