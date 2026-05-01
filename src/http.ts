@@ -135,8 +135,10 @@ async function main(): Promise<void> {
     });
 
     res.on("close", () => {
-      transport.close();
-      server.close();
+      // close() is async; swallow rejections so a transport-already-closed
+      // race doesn't surface as an unhandledRejection and crash the process.
+      void transport.close().catch(() => {});
+      void server.close().catch(() => {});
     });
 
     try {
