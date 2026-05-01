@@ -69,9 +69,37 @@ Or via npx without cloning (once published):
 COD_NETWORK_API_TOKEN=your-token npx cod-network-mcp
 ```
 
+## Two transports: stdio vs HTTP
+
+The same tools are exposed via two entrypoints:
+
+| Entrypoint        | Transport         | Best for                                                                 |
+| ----------------- | ----------------- | ------------------------------------------------------------------------ |
+| `dist/server.js`  | stdio             | ChatGPT Desktop, Claude Desktop, Cursor, Continue (local, no hosting)    |
+| `dist/http.js`    | Streamable HTTP   | ChatGPT (web/mobile) custom connectors, n8n, anything that wants a URL   |
+
+For the URL-based mode, deploy `dist/http.js` somewhere reachable from the
+client and point the client at `https://your-host/mcp`. See
+[Deploy the HTTP server](#deploy-the-http-server) below.
+
 ## Connect it to a client
 
-### ChatGPT (Desktop)
+### ChatGPT (custom connector via URL)
+
+> ChatGPT's *Settings → Connectors → Add custom connector* takes a URL plus
+> an optional Bearer token. This needs the HTTP entrypoint.
+
+1. Deploy the server (see [Deploy the HTTP server](#deploy-the-http-server))
+   and grab its URL — e.g. `https://cod-network-mcp.fly.dev/mcp`.
+2. Generate a long random `MCP_AUTH_TOKEN` and set it as a server env var (the
+   provided `render.yaml` and the Fly.io secret commands do this for you).
+3. In ChatGPT, **Settings → Connectors → Add custom connector**:
+   - **Server URL**: `https://your-host/mcp`
+   - **Authentication**: `API Key` / Bearer
+   - **API Key**: paste the `MCP_AUTH_TOKEN` value
+4. Save and start a new chat — the `cod_*` tools appear in the tool picker.
+
+### ChatGPT Desktop (stdio)
 
 ChatGPT's desktop app speaks MCP via stdio. Add an entry to your MCP config
 (typically `~/Library/Application Support/ChatGPT/mcp.json` on macOS,
@@ -155,6 +183,59 @@ Replace the `command`/`args` pair with:
 | `COD_NETWORK_PASSWORD`  | one of token / email+pw      | Seller account password.                                                   |
 | `COD_NETWORK_BASE_URL`  | no                           | Override base URL. Defaults to `https://api.cod.network/v2`.               |
 | `COD_NETWORK_TIMEOUT_MS`| no                           | HTTP timeout in milliseconds. Defaults to `30000`.                         |
+| `MCP_AUTH_TOKEN`        | HTTP entrypoint only         | Bearer token clients must send to call `/mcp`. **Set this in production.** |
+| `PORT`                  | HTTP entrypoint only         | Port to bind. Defaults to `8080`.                                          |
+| `HOST`                  | HTTP entrypoint only         | Bind address. Defaults to `0.0.0.0`.                                       |
+
+## Deploy the HTTP server
+
+The HTTP entrypoint (`dist/http.js`) is a standalone Express app on port
+`8080`. Any container host works; recipes for the popular ones are below.
+
+### Fly.io
+
+```bash
+flyctl launch --no-deploy                # claim the app name
+flyctl secrets set \
+  COD_NETWORK_EMAIL=you@example.com \
+  COD_NETWORK_PASSWORD=your-password \
+  MCP_AUTH_TOKEN="$(openssl rand -base64 32)"
+flyctl deploy
+flyctl secrets list                       # MCP_AUTH_TOKEN value not shown
+flyctl ssh console -C "printenv MCP_AUTH_TOKEN"   # reveal it once
+```
+
+You'll get a URL like `https://cod-network-mcp.fly.dev/mcp`.
+
+### Render.com (no credit card)
+
+Push this repo to GitHub, then Render Dashboard → **New → Blueprint** → point at
+the repo. Render reads [`render.yaml`](render.yaml), provisions a Docker web
+service on the free plan, generates `MCP_AUTH_TOKEN` automatically, and
+prompts you to fill in `COD_NETWORK_EMAIL` / `COD_NETWORK_PASSWORD`.
+
+### Any Docker host
+
+```bash
+docker build -t cod-network-mcp .
+docker run --rm -p 8080:8080 \
+  -e COD_NETWORK_EMAIL=you@example.com \
+  -e COD_NETWORK_PASSWORD=your-password \
+  -e MCP_AUTH_TOKEN="$(openssl rand -base64 32)" \
+  cod-network-mcp
+```
+
+### Run locally for testing
+
+```bash
+npm install && npm run build
+PORT=8765 \
+  COD_NETWORK_EMAIL=you@example.com \
+  COD_NETWORK_PASSWORD=your-password \
+  MCP_AUTH_TOKEN=dev-token \
+  node dist/http.js
+# → POST http://127.0.0.1:8765/mcp with `Authorization: Bearer dev-token`
+```
 
 ## Development
 
