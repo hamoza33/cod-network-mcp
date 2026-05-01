@@ -86,18 +86,27 @@ client and point the client at `https://your-host/mcp`. See
 
 ### ChatGPT (custom connector via URL)
 
-> ChatGPT's *Settings → Connectors → Add custom connector* takes a URL plus
-> an optional Bearer token. This needs the HTTP entrypoint.
+> ChatGPT's *Settings → Connectors → Add custom connector* requires a URL
+> backed by a full **OAuth 2.1** flow (PKCE + Dynamic Client Registration);
+> it refuses static-Bearer endpoints. The HTTP entrypoint already implements
+> this — you just need to deploy it.
 
-1. Deploy the server (see [Deploy the HTTP server](#deploy-the-http-server))
-   and grab its URL — e.g. `https://cod-network-mcp.fly.dev/mcp`.
-2. Generate a long random `MCP_AUTH_TOKEN` and set it as a server env var (the
-   provided `render.yaml` and the Fly.io secret commands do this for you).
-3. In ChatGPT, **Settings → Connectors → Add custom connector**:
+1. Deploy the server (see [Deploy the HTTP server](#deploy-the-http-server)).
+   Make sure `MCP_PUBLIC_URL` is set to the public HTTPS origin (e.g.
+   `https://cod-network-mcp.fly.dev`) so the OAuth metadata advertises
+   `https://` URLs.
+2. In ChatGPT, **Settings → Connectors → Add custom connector**:
    - **Server URL**: `https://your-host/mcp`
-   - **Authentication**: `API Key` / Bearer
-   - **API Key**: paste the `MCP_AUTH_TOKEN` value
-4. Save and start a new chat — the `cod_*` tools appear in the tool picker.
+   - Leave authentication on the default — ChatGPT will discover OAuth from
+     `/.well-known/oauth-authorization-server` and walk you through the flow.
+3. ChatGPT opens a browser tab with the server's login page; paste your
+   `MCP_AUTH_TOKEN` value to grant access. (You can rotate it later with
+   `flyctl secrets set MCP_AUTH_TOKEN=$(openssl rand -base64 32)`.)
+4. Start a new chat — the `cod_*` tools appear in the tool picker.
+
+For non-ChatGPT clients (`curl`, scripts, Claude Desktop), the static
+`MCP_AUTH_TOKEN` is also accepted directly as `Authorization: Bearer …` on
+`/mcp`, no OAuth dance required.
 
 ### ChatGPT Desktop (stdio)
 
@@ -183,7 +192,8 @@ Replace the `command`/`args` pair with:
 | `COD_NETWORK_PASSWORD`  | one of token / email+pw      | Seller account password.                                                   |
 | `COD_NETWORK_BASE_URL`  | no                           | Override base URL. Defaults to `https://api.cod.network/v2`.               |
 | `COD_NETWORK_TIMEOUT_MS`| no                           | HTTP timeout in milliseconds. Defaults to `30000`.                         |
-| `MCP_AUTH_TOKEN`        | HTTP entrypoint only         | Bearer token clients must send to call `/mcp`. **Set this in production.** |
+| `MCP_AUTH_TOKEN`        | HTTP entrypoint only         | Doubles as: (1) admin Bearer token for `curl` / Claude Desktop, (2) the password the OAuth login page asks for. **Set this in production.** |
+| `MCP_PUBLIC_URL`        | HTTP entrypoint only         | Public HTTPS origin (no path), e.g. `https://cod-network-mcp.fly.dev`. Used as the OAuth issuer URL. |
 | `PORT`                  | HTTP entrypoint only         | Port to bind. Defaults to `8080`.                                          |
 | `HOST`                  | HTTP entrypoint only         | Bind address. Defaults to `0.0.0.0`.                                       |
 
@@ -199,13 +209,14 @@ flyctl launch --no-deploy                # claim the app name
 flyctl secrets set \
   COD_NETWORK_EMAIL=you@example.com \
   COD_NETWORK_PASSWORD=your-password \
-  MCP_AUTH_TOKEN="$(openssl rand -base64 32)"
+  MCP_AUTH_TOKEN="$(openssl rand -base64 32)" \
+  MCP_PUBLIC_URL=https://your-app-name.fly.dev
 flyctl deploy
-flyctl secrets list                       # MCP_AUTH_TOKEN value not shown
-flyctl ssh console -C "printenv MCP_AUTH_TOKEN"   # reveal it once
+flyctl ssh console -C "printenv MCP_AUTH_TOKEN"   # reveal the value once
 ```
 
-You'll get a URL like `https://cod-network-mcp.fly.dev/mcp`.
+You'll get a URL like `https://your-app-name.fly.dev/mcp`. Use that as the
+**Server URL** in ChatGPT.
 
 ### Render.com (no credit card)
 
@@ -230,11 +241,19 @@ docker run --rm -p 8080:8080 \
 ```bash
 npm install && npm run build
 PORT=8765 \
+  MCP_PUBLIC_URL=http://127.0.0.1:8765 \
   COD_NETWORK_EMAIL=you@example.com \
   COD_NETWORK_PASSWORD=your-password \
   MCP_AUTH_TOKEN=dev-token \
   node dist/http.js
-# → POST http://127.0.0.1:8765/mcp with `Authorization: Bearer dev-token`
+# Admin / curl mode:
+#   POST http://127.0.0.1:8765/mcp with `Authorization: Bearer dev-token`
+# Full OAuth flow (what ChatGPT does):
+#   1. POST /register {client_name,redirect_uris:[…],…}
+#   2. GET  /authorize?response_type=code&client_id=…&code_challenge=…
+#   3. (browser) paste MCP_AUTH_TOKEN into the login page
+#   4. POST /token grant_type=authorization_code code=… code_verifier=…
+#   5. POST /mcp with `Authorization: Bearer <access_token>`
 ```
 
 ## Development
