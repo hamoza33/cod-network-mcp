@@ -142,24 +142,6 @@ const getDropProduct = tool({
     }),
 });
 
-const listMarketplaceProducts = tool({
-  name: "cod_list_marketplace_products",
-  description:
-    "List products available in the COD Network marketplace (the broader catalog of products the seller can source).",
-  inputSchema: z.object({
-    name: z.string().optional(),
-    sku: z.string().optional(),
-    country: z
-      .string()
-      .optional()
-      .describe("Country ISO code 2 (e.g. `MA`, `SA`)."),
-    ...Pagination,
-    ...Sort,
-  }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/marketplace-products", query: q(input) }),
-});
-
 const listStocks = tool({
   name: "cod_list_stocks",
   description: "List stock levels per product per warehouse / country.",
@@ -290,49 +272,6 @@ const getInvoice = tool({
     client.request({ path: `/seller/invoices/${encodeURIComponent(String(id))}` }),
 });
 
-const getStatistics = tool({
-  name: "cod_get_statistics",
-  description:
-    "Aggregate seller statistics (orders, revenue, delivery rate, etc.) for a date range and optional country.",
-  inputSchema: z.object({
-    from: z.string().optional().describe("Start date (YYYY-MM-DD)."),
-    to: z.string().optional().describe("End date (YYYY-MM-DD)."),
-    country: z.string().optional().describe("Country ISO code 2."),
-    group_by: z
-      .string()
-      .optional()
-      .describe("Group results (e.g. `day`, `week`, `month`, `country`)."),
-  }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/statistics", query: q(input) }),
-});
-
-const getConfirmedDashboard = tool({
-  name: "cod_get_confirmed_dashboard",
-  description:
-    "Get the Confirmed Dashboard summary (call-center confirmation funnel: counts, rates, top reasons).",
-  inputSchema: z.object({
-    from: z.string().optional(),
-    to: z.string().optional(),
-    country: z.string().optional(),
-  }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/confirmed-dashboard", query: q(input) }),
-});
-
-const getDeliveredDashboard = tool({
-  name: "cod_get_delivered_dashboard",
-  description:
-    "Get the Delivered Dashboard summary (shipment / delivery funnel: counts, rates, top failure reasons).",
-  inputSchema: z.object({
-    from: z.string().optional(),
-    to: z.string().optional(),
-    country: z.string().optional(),
-  }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/delivered-dashboard", query: q(input) }),
-});
-
 const listSourceRequests = tool({
   name: "cod_list_source_requests",
   description: "List sourcing requests submitted to COD Network.",
@@ -345,22 +284,15 @@ const listSourceRequests = tool({
     client.request({ path: "/seller/source-requests", query: q(input) }),
 });
 
-const listPurchases = tool({
-  name: "cod_list_purchases",
-  description: "List the seller's inventory purchases / restocks.",
-  inputSchema: z.object({
-    status: z.string().optional(),
-    created_from: z.string().optional(),
-    created_to: z.string().optional(),
-    ...Pagination,
-    ...Sort,
-  }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/purchases", query: q(input) }),
-});
-
 /* -------------------------------------------------------------------------- */
 /*  Escape hatch                                                              */
+/*                                                                            */
+/*  The docs site (developer.cod.network/v2) lists pages for                  */
+/*  "Confirmed Dashboard", "Delivered Dashboard", "Statistics", "Purchases",  */
+/*  and "Marketplace Products" — but the corresponding REST paths are not     */
+/*  reachable as of writing (all return 404 against api.cod.network/v2).      */
+/*  Use cod_raw_request when those become available, or contact COD support   */
+/*  for the exact path.                                                       */
 /* -------------------------------------------------------------------------- */
 
 const rawRequest = tool({
@@ -397,7 +329,6 @@ export const tools: ReadonlyArray<ToolDef> = [
   getProduct,
   listDropProducts,
   getDropProduct,
-  listMarketplaceProducts,
   listStocks,
   listOrders,
   getOrder,
@@ -406,10 +337,6 @@ export const tools: ReadonlyArray<ToolDef> = [
   listStores,
   listInvoices,
   getInvoice,
-  getStatistics,
-  getConfirmedDashboard,
-  getDeliveredDashboard,
   listSourceRequests,
-  listPurchases,
   rawRequest,
 ];

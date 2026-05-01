@@ -20,7 +20,6 @@ an LLM can answer questions like:
 | `cod_get_product`                 | `GET /seller/products/{id}`           |
 | `cod_list_drop_products`          | `GET /seller/drop-products`           |
 | `cod_get_drop_product`            | `GET /seller/drop-products/{id}`      |
-| `cod_list_marketplace_products`   | `GET /seller/marketplace-products`    |
 | `cod_list_stocks`                 | `GET /seller/stocks`                  |
 | `cod_list_orders`                 | `GET /seller/orders`                  |
 | `cod_get_order`                   | `GET /seller/orders/{id}`             |
@@ -29,12 +28,14 @@ an LLM can answer questions like:
 | `cod_list_stores`                 | `GET /seller/stores`                  |
 | `cod_list_invoices`               | `GET /seller/invoices`                |
 | `cod_get_invoice`                 | `GET /seller/invoices/{id}`           |
-| `cod_get_statistics`              | `GET /seller/statistics`              |
-| `cod_get_confirmed_dashboard`     | `GET /seller/confirmed-dashboard`     |
-| `cod_get_delivered_dashboard`     | `GET /seller/delivered-dashboard`     |
 | `cod_list_source_requests`        | `GET /seller/source-requests`         |
-| `cod_list_purchases`              | `GET /seller/purchases`               |
 | `cod_raw_request`                 | any documented endpoint (escape hatch) |
+
+> The docs at developer.cod.network/v2 also list pages for *Confirmed
+> Dashboard*, *Delivered Dashboard*, *Statistics*, *Purchases* and
+> *Marketplace Products*, but the corresponding REST paths return 404 today.
+> Use `cod_raw_request` to call them directly once COD Network publishes the
+> exact paths.
 
 All tools support pagination (`page`, `per_page`) and sorting (`sort`, prefix
 with `-` for descending). See each tool's input schema for the full set of

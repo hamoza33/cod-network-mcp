@@ -81,4 +81,5 @@ try {
 } finally {
   server.kill();
   await once(server, "exit").catch(() => {});
+  process.exit(0);
 }
