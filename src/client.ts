@@ -5,6 +5,9 @@
 
 const DEFAULT_BASE_URL = "https://api.cod.network/v2";
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** HTTP status codes we retry once with backoff (transient upstream errors). */
+const TRANSIENT_STATUSES = new Set([502, 503, 504]);
+const TRANSIENT_RETRY_BACKOFF_MS = [400, 1200];
 
 export interface CodClientOptions {
   /**
@@ -113,21 +116,43 @@ export class CodClient {
     if (!this.token) {
       await this.login();
     }
-    try {
-      return await this.rawRequest<T>(opts);
-    } catch (err) {
-      if (
-        err instanceof CodApiError &&
-        err.status === 401 &&
-        this.email &&
-        this.password
-      ) {
-        // Token expired or invalidated -> re-login once and retry.
-        await this.login();
+    let attempt = 0;
+    let reloggedIn = false;
+    // 1 initial try + up to TRANSIENT_RETRY_BACKOFF_MS.length retries on 5xx.
+    const maxAttempts = TRANSIENT_RETRY_BACKOFF_MS.length + 1;
+    let lastErr: unknown;
+    while (attempt < maxAttempts) {
+      try {
         return await this.rawRequest<T>(opts);
+      } catch (err) {
+        lastErr = err;
+        if (
+          err instanceof CodApiError &&
+          err.status === 401 &&
+          this.email &&
+          this.password &&
+          !reloggedIn
+        ) {
+          // Token expired or invalidated -> re-login once and retry. Doesn't
+          // count as a transient retry.
+          reloggedIn = true;
+          await this.login();
+          continue;
+        }
+        if (
+          err instanceof CodApiError &&
+          (TRANSIENT_STATUSES.has(err.status) || err.status === 0) &&
+          attempt < TRANSIENT_RETRY_BACKOFF_MS.length
+        ) {
+          const wait = TRANSIENT_RETRY_BACKOFF_MS[attempt] ?? 1000;
+          await new Promise((resolve) => setTimeout(resolve, wait));
+          attempt += 1;
+          continue;
+        }
+        throw err;
       }
-      throw err;
     }
+    throw lastErr ?? new CodApiError("request: unreachable", 0);
   }
 
   /** Single-shot HTTP request without retry/login logic. */
