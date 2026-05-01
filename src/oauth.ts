@@ -12,7 +12,7 @@
  * re-prompt the user. That's acceptable for this use case.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler, Response } from "express";
 import type {
   AuthorizationParams,
@@ -75,13 +75,19 @@ class InMemoryClientsStore implements OAuthRegisteredClientsStore {
   }
 }
 
+/**
+ * Constant-time string equality that does not leak input length.
+ *
+ * Hashing both sides to a fixed-size digest first means the buffers passed to
+ * `timingSafeEqual` are always the same length, so a length mismatch on the
+ * raw inputs is no longer observable from the outside. SHA-256 is collision-
+ * resistant for our threat model (an attacker would need a preimage to fake
+ * a match, not just a collision against a known token).
+ */
 function timingSafeEq(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return mismatch === 0;
+  const ha = createHash("sha256").update(a, "utf8").digest();
+  const hb = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(ha, hb);
 }
 
 function escapeHtml(s: string): string {
