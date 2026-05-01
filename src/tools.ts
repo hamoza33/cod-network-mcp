@@ -21,9 +21,11 @@ const Pagination = {
     .number()
     .int()
     .min(1)
-    .max(100)
+    .max(10)
     .optional()
-    .describe("Items per page (max 100)."),
+    .describe(
+      "Items per page. The API silently caps this at 10 even if a higher value is requested, so iterate with `page` to fetch more than 10 results.",
+    ),
 };
 
 const Sort = {
@@ -164,23 +166,19 @@ const listStocks = tool({
 const listOrders = tool({
   name: "cod_list_orders",
   description:
-    "List the seller's orders. Each order includes customer info, status, shipping and delivery dates. Supports filtering, pagination, sorting and includes.",
+    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. To answer date-bounded questions (e.g. 'orders last week'), page through results until the `created_at` field is older than the desired range and aggregate client-side: the API ignores arbitrary date filters and caps `per_page` at 10.",
   inputSchema: z.object({
     status: z
       .string()
       .optional()
-      .describe("Filter by order status (e.g. `delivered`, `shipped`, `cancelled`)."),
+      .describe(
+        "Filter by order status. Known values: `pending`, `assigned`, `shipped`, `delivered`, `returned`, `cancelled`. Case-insensitive.",
+      ),
     reference: z.string().optional().describe("Filter by order reference."),
-    customer_phone: z.string().optional(),
-    customer_country: z.string().optional().describe("Country ISO code 2."),
-    created_from: z
+    customer_phone: z
       .string()
       .optional()
-      .describe("Created at >= this ISO date (YYYY-MM-DD)."),
-    created_to: z
-      .string()
-      .optional()
-      .describe("Created at <= this ISO date (YYYY-MM-DD)."),
+      .describe("Filter by customer phone number (best-effort match)."),
     ...Includes,
     ...Pagination,
     ...Sort,
@@ -206,13 +204,13 @@ const getOrder = tool({
 const listLeads = tool({
   name: "cod_list_leads",
   description:
-    "List leads (incoming orders before confirmation). Includes customer details, status and source.",
+    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Same pagination caveats as `cod_list_orders`: page through results to handle date ranges client-side; `per_page` is capped at 10.",
   inputSchema: z.object({
-    status: z.string().optional(),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by lead status (e.g. `new`, `confirmed`, `cancelled`)."),
     customer_phone: z.string().optional(),
-    customer_country: z.string().optional().describe("Country ISO code 2."),
-    created_from: z.string().optional(),
-    created_to: z.string().optional(),
     ...Includes,
     ...Pagination,
     ...Sort,
@@ -250,11 +248,13 @@ const listStores = tool({
 
 const listInvoices = tool({
   name: "cod_list_invoices",
-  description: "List the seller's invoices (remittance / payouts).",
+  description:
+    "List the seller's invoices (remittance / payouts), newest first. Page through results to filter by date client-side; `per_page` is capped at 10.",
   inputSchema: z.object({
-    status: z.string().optional(),
-    created_from: z.string().optional(),
-    created_to: z.string().optional(),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by invoice status (e.g. `paid`, `pending`)."),
     ...Pagination,
     ...Sort,
   }),
