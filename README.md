@@ -29,7 +29,18 @@ an LLM can answer questions like:
 | `cod_list_invoices`               | `GET /seller/invoices`                |
 | `cod_get_invoice`                 | `GET /seller/invoices/{id}`           |
 | `cod_list_source_requests`        | `GET /seller/source-requests`         |
+| `cod_summarize_period`            | aggregates orders + leads in one call (paginates internally) |
+| `cod_search_products`             | substring search on name/SKU across products + drop-products |
 | `cod_raw_request`                 | any documented endpoint (escape hatch) |
+
+### Aggregation tools
+
+The COD API caps `per_page` at 10 and silently ignores arbitrary date / name
+filters, which makes naïve LLM workflows extremely chatty. The two aggregation
+tools handle pagination and filtering server-side:
+
+- **`cod_summarize_period({ since, until?, bucket?, group_by_product?, product_query?, include_examples? })`** — returns a compact JSON with totals, by-status, by-country, revenue per currency, confirmation/delivery rates. Set `bucket: "day" | "week" | "month"` to also get a `series` array (e.g. one row per day for a 30-day spreadsheet). Set `group_by_product: true` to add `by_product` breakdowns. Set `product_query` to limit the whole summary to rows touching a specific product.
+- **`cod_search_products({ query, kind?, limit? })`** — case-insensitive substring search on name/SKU across the seller's owned catalog (`kind: "products"`), the dropshipping catalog (`kind: "drop_products"`), or both. Paginates client-side because the COD `name=` / `q=` filters either don't match or only do exact-match.
 
 > The docs at developer.cod.network/v2 also list pages for *Confirmed
 > Dashboard*, *Delivered Dashboard*, *Statistics*, *Purchases* and
