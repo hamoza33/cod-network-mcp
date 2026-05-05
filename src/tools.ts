@@ -102,7 +102,7 @@ function q(input: Record<string, unknown>): Record<string, string | number | boo
 const listProducts = tool({
   name: "cod_list_products",
   description:
-    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Supports pagination and sorting.",
+    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Supports pagination and sorting only — the API ignores `name=` / `q=` filters server-side, so for name/SKU substring search use `cod_search_products` instead.",
   inputSchema: z.object({ ...Pagination, ...Sort }),
   handler: (input, client) =>
     client.request({ path: "/seller/products", query: q(input) }),
@@ -121,10 +121,10 @@ const getProduct = tool({
 const listDropProducts = tool({
   name: "cod_list_drop_products",
   description:
-    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). Supports filtering by name or sku.",
+    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). The `name=` and `sku=` filters are EXACT-match server-side — for substring search use `cod_search_products` with `kind: 'drop_products'`.",
   inputSchema: z.object({
-    name: z.string().optional().describe("Filter by drop product name."),
-    sku: z.string().optional().describe("Filter by sku."),
+    name: z.string().optional().describe("Filter by exact drop product name (case-sensitive)."),
+    sku: z.string().optional().describe("Filter by exact SKU."),
     ...Pagination,
     ...Sort,
   }),
@@ -296,6 +296,12 @@ const listSourceRequests = tool({
  */
 const SUMMARY_MAX_PAGES = 200;
 
+interface CodOrderItem {
+  quantity?: number;
+  price?: number;
+  product?: { data?: { id?: number; sku?: string; name?: string } };
+}
+
 interface CodOrder {
   id: number;
   status?: { label?: string; code?: number };
@@ -306,12 +312,22 @@ interface CodOrder {
   delivered_at?: string | null;
   returned_at?: string | null;
   created_at?: string;
+  items?: { data?: CodOrderItem[] };
 }
 
 interface CodLead {
   id: number;
   status?: { label?: string; code?: number };
   created_at?: string;
+  /** Free-text product line, typically `"Name/SKU"`. */
+  products?: string;
+}
+
+interface CodProduct {
+  id: number;
+  name?: string;
+  name_arabic?: string;
+  sku?: string;
 }
 
 interface CodListResponse<T> {
@@ -393,10 +409,159 @@ function bucketBy<T>(rows: T[], key: (r: T) => string | undefined): Record<strin
   return out;
 }
 
+const round = (n: number, dp = 2): number =>
+  Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp);
+
+/** Pull a list of product names referenced by an order line. */
+function orderProductNames(o: CodOrder): string[] {
+  const items = o.items?.data ?? [];
+  const names: string[] = [];
+  for (const it of items) {
+    const n = it.product?.data?.name;
+    if (n) names.push(n);
+  }
+  return names;
+}
+
+/**
+ * Leads carry a free-text `products` field, typically `"Name/SKU"` and
+ * sometimes multiple lines for multi-product baskets. We split on common
+ * separators and strip the trailing `/SKU` suffix to leave just the name.
+ */
+function leadProductNames(l: CodLead): string[] {
+  if (!l.products) return [];
+  const lines = l.products
+    .split(/[\n,;|]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return lines.map((line) => {
+    const slash = line.lastIndexOf("/");
+    return slash > 0 ? line.slice(0, slash).trim() : line;
+  });
+}
+
+/** Produce the bucket key (period start) for a UTC `created_at` string. */
+function bucketKey(ts: string, bucket: "day" | "week" | "month"): string {
+  // ts is "YYYY-MM-DD HH:MM:SS"
+  if (bucket === "day") return ts.slice(0, 10);
+  if (bucket === "month") return ts.slice(0, 7);
+  // ISO week: Monday-based, returns "YYYY-Www".
+  const d = new Date(`${ts.slice(0, 10)}T00:00:00Z`);
+  const day = (d.getUTCDay() + 6) % 7; // Mon=0..Sun=6
+  d.setUTCDate(d.getUTCDate() - day + 3); // nearest Thursday
+  const week1 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  const weekNum =
+    1 +
+    Math.round(((d.getTime() - week1.getTime()) / 86400000 - 3 + ((week1.getUTCDay() + 6) % 7)) / 7);
+  return `${d.getUTCFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+}
+
+interface OrdersAgg {
+  count: number;
+  by_status: Record<string, number>;
+  by_country: Record<string, number>;
+  revenue_by_currency: Record<string, number>;
+  revenue_usd_estimate: number;
+  delivered_count: number;
+  returned_count: number;
+  delivery_rate_pct: number;
+}
+
+function aggregateOrders(rows: CodOrder[]): OrdersAgg {
+  const revenueByCurrency: Record<string, number> = {};
+  let revenueUsd = 0;
+  for (const o of rows) {
+    const cur = o.currency ?? "(unknown)";
+    revenueByCurrency[cur] = (revenueByCurrency[cur] ?? 0) + (o.total ?? 0);
+    revenueUsd += o.total_usd ?? 0;
+  }
+  const delivered = rows.filter((o) => o.delivered_at).length;
+  const returned = rows.filter((o) => o.returned_at).length;
+  return {
+    count: rows.length,
+    by_status: bucketBy(rows, (o) => o.status?.label),
+    by_country: bucketBy(rows, (o) => o.customer_country_name),
+    revenue_by_currency: Object.fromEntries(
+      Object.entries(revenueByCurrency).map(([k, v]) => [k, round(v)]),
+    ),
+    revenue_usd_estimate: round(revenueUsd),
+    delivered_count: delivered,
+    returned_count: returned,
+    delivery_rate_pct: rows.length > 0 ? round((delivered / rows.length) * 100, 1) : 0,
+  };
+}
+
+interface LeadsAgg {
+  count: number;
+  by_status: Record<string, number>;
+  confirmed_count: number;
+  confirmation_rate_pct: number;
+}
+
+function aggregateLeads(rows: CodLead[]): LeadsAgg {
+  const confirmed = rows.filter((l) => (l.status?.label ?? "").toLowerCase() === "confirmed").length;
+  return {
+    count: rows.length,
+    by_status: bucketBy(rows, (l) => l.status?.label),
+    confirmed_count: confirmed,
+    confirmation_rate_pct: rows.length > 0 ? round((confirmed / rows.length) * 100, 1) : 0,
+  };
+}
+
+function aggregateOrdersByProduct(
+  rows: CodOrder[],
+): Array<{ product: string; orders: number; total_qty: number; revenue: Record<string, number> }> {
+  const stats = new Map<
+    string,
+    { product: string; orders: number; total_qty: number; revenue: Record<string, number> }
+  >();
+  for (const o of rows) {
+    const items = o.items?.data ?? [];
+    const seenInOrder = new Set<string>();
+    for (const it of items) {
+      const name = it.product?.data?.name ?? "(unknown)";
+      const e =
+        stats.get(name) ??
+        { product: name, orders: 0, total_qty: 0, revenue: {} as Record<string, number> };
+      // Count distinct orders per product, but sum quantity across line items.
+      if (!seenInOrder.has(name)) {
+        e.orders += 1;
+        seenInOrder.add(name);
+      }
+      e.total_qty += it.quantity ?? 0;
+      const cur = o.currency ?? "(unknown)";
+      e.revenue[cur] = round((e.revenue[cur] ?? 0) + (it.price ?? 0) * (it.quantity ?? 0));
+      stats.set(name, e);
+    }
+  }
+  return [...stats.values()].sort((a, b) => b.orders - a.orders);
+}
+
+function aggregateLeadsByProduct(
+  rows: CodLead[],
+): Array<{ product: string; leads: number; confirmed: number; confirmation_rate_pct: number }> {
+  const stats = new Map<string, { product: string; leads: number; confirmed: number }>();
+  for (const l of rows) {
+    const isConfirmed = (l.status?.label ?? "").toLowerCase() === "confirmed";
+    for (const name of leadProductNames(l)) {
+      const e = stats.get(name) ?? { product: name, leads: 0, confirmed: 0 };
+      e.leads += 1;
+      if (isConfirmed) e.confirmed += 1;
+      stats.set(name, e);
+    }
+  }
+  return [...stats.values()]
+    .map((e) => ({
+      ...e,
+      confirmation_rate_pct: e.leads > 0 ? round((e.confirmed / e.leads) * 100, 1) : 0,
+    }))
+    .sort((a, b) => b.leads - a.leads);
+}
+
 const summarizePeriod = tool({
   name: "cod_summarize_period",
   description:
-    "One-shot summary of leads + orders within a date range. Paginates the COD API internally and returns aggregate counts by status and country, revenue per currency, and confirmation/delivery rates — without you having to scroll through pages of raw rows. Prefer this for any 'today', 'last week', 'this month' style question.",
+    "One-shot summary of leads + orders within a date range. Paginates the COD API internally and returns aggregates without forcing you to scroll raw rows. Use `bucket` for daily/weekly/monthly breakdowns (one call covers a 30-day spreadsheet). Use `group_by_product=true` to get per-product order/lead/revenue breakdowns. Use `product_query` to restrict the whole summary to rows touching a specific product (case-insensitive substring on product name).",
   inputSchema: z.object({
     since: z
       .string()
@@ -411,12 +576,31 @@ const summarizePeriod = tool({
       ),
     include_orders: z.boolean().optional().default(true),
     include_leads: z.boolean().optional().default(true),
+    bucket: z
+      .enum(["day", "week", "month"])
+      .optional()
+      .describe(
+        "If set, return a `series` array with one summary per bucket (UTC). E.g. `bucket: 'day'` plus a 30-day `since` returns 30 daily rows.",
+      ),
+    group_by_product: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Include `orders.by_product` and `leads.by_product` arrays. Adds an `?include=items` fetch on orders, slightly slower for large ranges.",
+      ),
+    product_query: z
+      .string()
+      .optional()
+      .describe(
+        "Case-insensitive substring; only rows where any product name contains this are counted. Forces `?include=items` on orders.",
+      ),
     include_examples: z
       .boolean()
       .optional()
       .default(false)
       .describe(
-        "If true, include lists of `order_ids` and `lead_ids` (capped at 50 each) so you can drill down with `cod_get_order` / `cod_get_lead`.",
+        "If true, include lists of `order_ids` and `lead_ids` (capped at 50 each).",
       ),
   }),
   handler: async (input, client) => {
@@ -428,81 +612,176 @@ const summarizePeriod = tool({
 
     const wantOrders = input.include_orders !== false;
     const wantLeads = input.include_leads !== false;
+    const needItems = input.group_by_product === true || !!input.product_query;
+    const productQuery = input.product_query?.trim().toLowerCase();
 
     const [ordersResult, leadsResult] = await Promise.all([
       wantOrders
-        ? paginateInRange<CodOrder>(client, "/seller/orders", since, until, {})
+        ? paginateInRange<CodOrder>(
+            client,
+            "/seller/orders",
+            since,
+            until,
+            needItems ? { include: "items" } : {},
+          )
         : Promise.resolve({ items: [], pagesScanned: 0, reachedCutoff: true }),
       wantLeads
         ? paginateInRange<CodLead>(client, "/seller/leads", since, until, {})
         : Promise.resolve({ items: [], pagesScanned: 0, reachedCutoff: true }),
     ]);
 
-    const ordersByStatus = bucketBy(ordersResult.items, (o) => o.status?.label);
-    const ordersByCountry = bucketBy(ordersResult.items, (o) => o.customer_country_name);
-    const revenueByCurrency: Record<string, number> = {};
-    let revenueUsd = 0;
-    for (const o of ordersResult.items) {
-      const cur = o.currency ?? "(unknown)";
-      revenueByCurrency[cur] = (revenueByCurrency[cur] ?? 0) + (o.total ?? 0);
-      revenueUsd += o.total_usd ?? 0;
+    let orders = ordersResult.items;
+    let leads = leadsResult.items;
+    if (productQuery) {
+      orders = orders.filter((o) =>
+        orderProductNames(o).some((n) => n.toLowerCase().includes(productQuery)),
+      );
+      leads = leads.filter((l) =>
+        leadProductNames(l).some((n) => n.toLowerCase().includes(productQuery)),
+      );
     }
-
-    const delivered = ordersResult.items.filter((o) => o.delivered_at).length;
-    const returned = ordersResult.items.filter((o) => o.returned_at).length;
-
-    const leadsByStatus = bucketBy(leadsResult.items, (l) => l.status?.label);
-    const confirmedLeads = leadsResult.items.filter(
-      (l) => (l.status?.label ?? "").toLowerCase() === "confirmed",
-    ).length;
-
-    const round = (n: number, dp = 2): number =>
-      Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp);
 
     const summary: Record<string, unknown> = {
       range: { since, until },
-      orders: wantOrders
-        ? {
-            count: ordersResult.items.length,
-            by_status: ordersByStatus,
-            by_country: ordersByCountry,
-            revenue_by_currency: Object.fromEntries(
-              Object.entries(revenueByCurrency).map(([k, v]) => [k, round(v)]),
-            ),
-            revenue_usd_estimate: round(revenueUsd),
-            delivered_count: delivered,
-            returned_count: returned,
-            delivery_rate_pct:
-              ordersResult.items.length > 0
-                ? round((delivered / ordersResult.items.length) * 100, 1)
-                : 0,
-            pages_scanned: ordersResult.pagesScanned,
-            full_range_covered: ordersResult.reachedCutoff,
-          }
-        : undefined,
-      leads: wantLeads
-        ? {
-            count: leadsResult.items.length,
-            by_status: leadsByStatus,
-            confirmed_count: confirmedLeads,
-            confirmation_rate_pct:
-              leadsResult.items.length > 0
-                ? round((confirmedLeads / leadsResult.items.length) * 100, 1)
-                : 0,
-            pages_scanned: leadsResult.pagesScanned,
-            full_range_covered: leadsResult.reachedCutoff,
-          }
-        : undefined,
+      filter: productQuery ? { product_query: productQuery } : undefined,
     };
+
+    const ordersBlock = wantOrders
+      ? {
+          ...aggregateOrders(orders),
+          ...(input.group_by_product ? { by_product: aggregateOrdersByProduct(orders) } : {}),
+          pages_scanned: ordersResult.pagesScanned,
+          full_range_covered: ordersResult.reachedCutoff,
+        }
+      : undefined;
+    const leadsBlock = wantLeads
+      ? {
+          ...aggregateLeads(leads),
+          ...(input.group_by_product ? { by_product: aggregateLeadsByProduct(leads) } : {}),
+          pages_scanned: leadsResult.pagesScanned,
+          full_range_covered: leadsResult.reachedCutoff,
+        }
+      : undefined;
+    summary.orders = ordersBlock;
+    summary.leads = leadsBlock;
+
+    if (input.bucket) {
+      const bkt = input.bucket;
+      const periods = new Set<string>();
+      const ordersByPeriod = new Map<string, CodOrder[]>();
+      const leadsByPeriod = new Map<string, CodLead[]>();
+      for (const o of orders) {
+        if (!o.created_at) continue;
+        const k = bucketKey(o.created_at, bkt);
+        periods.add(k);
+        ordersByPeriod.set(k, [...(ordersByPeriod.get(k) ?? []), o]);
+      }
+      for (const l of leads) {
+        if (!l.created_at) continue;
+        const k = bucketKey(l.created_at, bkt);
+        periods.add(k);
+        leadsByPeriod.set(k, [...(leadsByPeriod.get(k) ?? []), l]);
+      }
+      summary.series = [...periods]
+        .sort()
+        .map((period) => ({
+          period,
+          orders: wantOrders ? aggregateOrders(ordersByPeriod.get(period) ?? []) : undefined,
+          leads: wantLeads ? aggregateLeads(leadsByPeriod.get(period) ?? []) : undefined,
+        }));
+      summary.bucket = bkt;
+    }
 
     if (input.include_examples) {
       summary.examples = {
-        order_ids: ordersResult.items.slice(0, 50).map((o) => o.id),
-        lead_ids: leadsResult.items.slice(0, 50).map((l) => l.id),
+        order_ids: orders.slice(0, 50).map((o) => o.id),
+        lead_ids: leads.slice(0, 50).map((l) => l.id),
       };
     }
 
     return summary;
+  },
+});
+
+const searchProducts = tool({
+  name: "cod_search_products",
+  description:
+    "Search the seller's product catalog by case-insensitive substring on name or SKU. The COD API ignores `name=` / `q=` filters server-side, so this tool paginates client-side and filters locally. Use `kind` to choose between owned products, dropshipping products, or both.",
+  inputSchema: z.object({
+    query: z
+      .string()
+      .describe("Case-insensitive substring matched against `name`, `name_arabic`, or `sku`."),
+    kind: z
+      .enum(["products", "drop_products", "both"])
+      .optional()
+      .default("products")
+      .describe("`products` = the seller's own catalog. `drop_products` = COD's dropshipping catalog. `both` = both."),
+    limit: z.number().int().min(1).max(100).optional().default(25),
+    max_pages: z
+      .number()
+      .int()
+      .min(1)
+      .max(SUMMARY_MAX_PAGES)
+      .optional()
+      .default(50)
+      .describe("Hard cap on COD API pages scanned. 50 pages * 10 items = 500 catalog rows."),
+  }),
+  handler: async (input, client) => {
+    const needle = input.query.trim().toLowerCase();
+    if (!needle) {
+      throw new Error("`query` must be non-empty.");
+    }
+    const want = input.kind ?? "products";
+    const maxPages = input.max_pages ?? 50;
+    const limit = input.limit ?? 25;
+
+    const matchesProduct = (p: CodProduct): boolean => {
+      const fields = [p.name, p.name_arabic, p.sku].filter(
+        (s): s is string => typeof s === "string",
+      );
+      return fields.some((s) => s.toLowerCase().includes(needle));
+    };
+
+    const scan = async (path: string): Promise<CodProduct[]> => {
+      const matches: CodProduct[] = [];
+      let pagesScanned = 0;
+      for (let page = 1; page <= maxPages && matches.length < limit; page += 1) {
+        const resp = await client.request<CodListResponse<CodProduct>>({
+          path,
+          query: { page, per_page: 10 },
+        });
+        pagesScanned = page;
+        const batch = resp.data ?? [];
+        if (batch.length === 0) break;
+        for (const p of batch) {
+          if (matchesProduct(p) && matches.length < limit) {
+            matches.push(p);
+          }
+        }
+        const meta = resp.meta?.pagination;
+        if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
+      }
+      // pagesScanned is informational; expose via the wrapper below.
+      (matches as CodProduct[] & { pagesScanned?: number }).pagesScanned = pagesScanned;
+      return matches;
+    };
+
+    const out: Record<string, unknown> = { query: needle };
+    if (want === "products" || want === "both") {
+      const m = await scan("/seller/products");
+      out.products = {
+        matches: m.map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+        pages_scanned: (m as CodProduct[] & { pagesScanned?: number }).pagesScanned ?? 0,
+      };
+    }
+    if (want === "drop_products" || want === "both") {
+      const m = await scan("/seller/drop-products");
+      out.drop_products = {
+        matches: m.map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+        pages_scanned: (m as CodProduct[] & { pagesScanned?: number }).pagesScanned ?? 0,
+      };
+    }
+    return out;
   },
 });
 
@@ -561,5 +840,6 @@ export const tools: ReadonlyArray<ToolDef> = [
   getInvoice,
   listSourceRequests,
   summarizePeriod,
+  searchProducts,
   rawRequest,
 ];
