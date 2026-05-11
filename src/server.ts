@@ -7,11 +7,8 @@
  * Network seller account. For ChatGPT (web/mobile) custom connectors, use the
  * HTTP entrypoint (`dist/http.js`) instead.
  *
- * Configuration via environment variables (provide either a token, or
- * email + password — the latter auto-refreshes on 401):
- *   COD_NETWORK_API_TOKEN  bearer token from the seller dashboard
- *   COD_NETWORK_EMAIL      seller account email (paired with COD_NETWORK_PASSWORD)
- *   COD_NETWORK_PASSWORD   seller account password
+ * Configuration via environment variables:
+ *   COD_NETWORK_API_TOKEN  (required) bearer token from the seller dashboard
  *   COD_NETWORK_BASE_URL   optional, defaults to https://api.cod.network/v2
  *   COD_NETWORK_TIMEOUT_MS optional positive integer, defaults to 30000
  */

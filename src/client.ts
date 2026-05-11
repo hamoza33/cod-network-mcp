@@ -10,18 +10,8 @@ const TRANSIENT_STATUSES = new Set([502, 503, 504]);
 const TRANSIENT_RETRY_BACKOFF_MS = [400, 1200];
 
 export interface CodClientOptions {
-  /**
-   * Bearer token from My profile -> API developer -> API Token.
-   *
-   * Optional if `email` + `password` are provided; in that case the client
-   * will obtain a token via `POST /seller/login` on first use and refresh
-   * it automatically when the API reports an expired token.
-   */
-  token?: string;
-  /** Seller account email (used for auto-login when `token` is missing or expired). */
-  email?: string;
-  /** Seller account password (used with `email`). */
-  password?: string;
+  /** Bearer token from My profile -> API developer -> API Token. */
+  token: string;
   /** Override base URL. Defaults to https://api.cod.network/v2. */
   baseUrl?: string;
   /** Request timeout in milliseconds. Defaults to 30000. */
@@ -54,71 +44,24 @@ export class CodApiError extends Error {
   }
 }
 
-interface LoginResponse {
-  status?: string;
-  access_token?: string;
-  expires_in?: number;
-}
-
 export class CodClient {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
-  private readonly email?: string;
-  private readonly password?: string;
-  private token: string | undefined;
-  private loginPromise: Promise<string> | undefined;
+  private readonly token: string;
 
   constructor(opts: CodClientOptions) {
-    if (!opts.token && !(opts.email && opts.password)) {
+    if (!opts.token) {
       throw new Error(
-        "CodClient: provide either `token`, or `email` + `password` for auto-login",
+        "CodClient: `token` is required. Get it from My profile -> API developer -> API Token.",
       );
     }
     this.token = opts.token;
-    this.email = opts.email;
-    this.password = opts.password;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
-  /** Force-refresh the cached token (re-runs login). Throws if no email/password. */
-  async login(): Promise<string> {
-    if (!this.email || !this.password) {
-      throw new CodApiError(
-        "Cannot auto-login: COD_NETWORK_EMAIL / COD_NETWORK_PASSWORD not configured. " +
-          "Set them, or provide a fresh COD_NETWORK_API_TOKEN.",
-        401,
-      );
-    }
-    // Coalesce concurrent login attempts.
-    if (this.loginPromise) return this.loginPromise;
-    this.loginPromise = (async () => {
-      const data = await this.rawRequest<LoginResponse>({
-        method: "POST",
-        path: "/seller/login",
-        body: { email: this.email, password: this.password },
-        skipAuth: true,
-      });
-      if (!data?.access_token) {
-        throw new CodApiError("Login response missing access_token", 0, undefined, data);
-      }
-      this.token = data.access_token;
-      return data.access_token;
-    })();
-    try {
-      return await this.loginPromise;
-    } finally {
-      this.loginPromise = undefined;
-    }
-  }
-
   async request<T = unknown>(opts: CodRequestOptions): Promise<T> {
-    if (!this.token) {
-      await this.login();
-    }
     let attempt = 0;
-    let reloggedIn = false;
-    // 1 initial try + up to TRANSIENT_RETRY_BACKOFF_MS.length retries on 5xx.
     const maxAttempts = TRANSIENT_RETRY_BACKOFF_MS.length + 1;
     let lastErr: unknown;
     while (attempt < maxAttempts) {
@@ -126,19 +69,6 @@ export class CodClient {
         return await this.rawRequest<T>(opts);
       } catch (err) {
         lastErr = err;
-        if (
-          err instanceof CodApiError &&
-          err.status === 401 &&
-          this.email &&
-          this.password &&
-          !reloggedIn
-        ) {
-          // Token expired or invalidated -> re-login once and retry. Doesn't
-          // count as a transient retry.
-          reloggedIn = true;
-          await this.login();
-          continue;
-        }
         if (
           err instanceof CodApiError &&
           (TRANSIENT_STATUSES.has(err.status) || err.status === 0) &&
@@ -155,10 +85,7 @@ export class CodClient {
     throw lastErr ?? new CodApiError("request: unreachable", 0);
   }
 
-  /** Single-shot HTTP request without retry/login logic. */
-  private async rawRequest<T = unknown>(
-    opts: CodRequestOptions & { skipAuth?: boolean },
-  ): Promise<T> {
+  private async rawRequest<T = unknown>(opts: CodRequestOptions): Promise<T> {
     const method = opts.method ?? "GET";
     const path = opts.path.startsWith("/") ? opts.path : `/${opts.path}`;
     const url = new URL(`${this.baseUrl}${path}`);
@@ -179,9 +106,7 @@ export class CodClient {
       "User-Agent": "cod-network-mcp/0.1.0",
       ...(opts.headers ?? {}),
     };
-    if (!opts.skipAuth && this.token) {
-      headers.Authorization = `Bearer ${this.token}`;
-    }
+    headers.Authorization = `Bearer ${this.token}`;
 
     let body: BodyInit | undefined;
     if (opts.body !== undefined) {

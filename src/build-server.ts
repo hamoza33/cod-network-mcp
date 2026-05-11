@@ -13,24 +13,18 @@ import { CodApiError, CodClient } from "./client.js";
 import { tools } from "./tools.js";
 
 export interface CodConfig {
-  token?: string;
-  email?: string;
-  password?: string;
+  token: string;
   baseUrl?: string;
   timeoutMs?: number;
 }
 
 export function readCodConfig(): CodConfig {
   const token = process.env.COD_NETWORK_API_TOKEN;
-  const email = process.env.COD_NETWORK_EMAIL;
-  const password = process.env.COD_NETWORK_PASSWORD;
 
-  if (!token && !(email && password)) {
+  if (!token) {
     process.stderr.write(
-      "[cod-network-mcp] ERROR: no credentials configured.\n" +
-        "Set one of:\n" +
-        "  - COD_NETWORK_API_TOKEN (from seller dashboard: My profile -> API developer -> API Token)\n" +
-        "  - COD_NETWORK_EMAIL + COD_NETWORK_PASSWORD (auto-login + refresh)\n",
+      "[cod-network-mcp] ERROR: COD_NETWORK_API_TOKEN is required.\n" +
+        "Get it from the seller dashboard: My profile -> API developer -> API Token\n",
     );
     process.exit(1);
   }
@@ -51,7 +45,7 @@ export function readCodConfig(): CodConfig {
     }
   }
 
-  return { token, email, password, baseUrl, timeoutMs };
+  return { token, baseUrl, timeoutMs };
 }
 
 export function buildMcpServer(cfg: CodConfig): {
@@ -60,8 +54,6 @@ export function buildMcpServer(cfg: CodConfig): {
 } {
   const client = new CodClient({
     token: cfg.token,
-    email: cfg.email,
-    password: cfg.password,
     baseUrl: cfg.baseUrl,
     timeoutMs: cfg.timeoutMs,
   });
