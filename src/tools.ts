@@ -463,12 +463,16 @@ interface OrdersAgg {
   delivered_count: number;
   delivered_quantity: number;
   avg_quantity_per_delivered_order: number;
+  delivered_revenue_usd: number;
+  avg_usd_per_delivered_order: number;
   returned_count: number;
   returned_quantity: number;
+  returned_revenue_usd: number;
   delivery_rate_pct: number;
   by_status: Record<string, number>;
   by_country: Record<string, number>;
   revenue_by_currency: Record<string, number>;
+  delivered_revenue_by_currency: Record<string, number>;
   revenue_usd_estimate: number;
 }
 
@@ -480,7 +484,10 @@ function orderItemQty(o: CodOrder): number {
 
 function aggregateOrders(rows: CodOrder[]): OrdersAgg {
   const revenueByCurrency: Record<string, number> = {};
+  const deliveredRevByCurrency: Record<string, number> = {};
   let revenueUsd = 0;
+  let deliveredUsd = 0;
+  let returnedUsd = 0;
   let totalQty = 0;
   let deliveredQty = 0;
   let returnedQty = 0;
@@ -490,8 +497,15 @@ function aggregateOrders(rows: CodOrder[]): OrdersAgg {
     revenueUsd += o.total_usd ?? 0;
     const qty = orderItemQty(o);
     totalQty += qty;
-    if (o.delivered_at) deliveredQty += qty;
-    if (o.returned_at) returnedQty += qty;
+    if (o.delivered_at) {
+      deliveredQty += qty;
+      deliveredUsd += o.total_usd ?? 0;
+      deliveredRevByCurrency[cur] = (deliveredRevByCurrency[cur] ?? 0) + (o.total ?? 0);
+    }
+    if (o.returned_at) {
+      returnedQty += qty;
+      returnedUsd += o.total_usd ?? 0;
+    }
   }
   const deliveredCount = rows.filter((o) => o.delivered_at).length;
   const returnedCount = rows.filter((o) => o.returned_at).length;
@@ -502,13 +516,19 @@ function aggregateOrders(rows: CodOrder[]): OrdersAgg {
     delivered_count: deliveredCount,
     delivered_quantity: deliveredQty,
     avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+    delivered_revenue_usd: round(deliveredUsd),
+    avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
     returned_count: returnedCount,
     returned_quantity: returnedQty,
+    returned_revenue_usd: round(returnedUsd),
     delivery_rate_pct: rows.length > 0 ? round((deliveredCount / rows.length) * 100, 1) : 0,
     by_status: bucketBy(rows, (o) => o.status?.label),
     by_country: bucketBy(rows, (o) => o.customer_country_name),
     revenue_by_currency: Object.fromEntries(
       Object.entries(revenueByCurrency).map(([k, v]) => [k, round(v)]),
+    ),
+    delivered_revenue_by_currency: Object.fromEntries(
+      Object.entries(deliveredRevByCurrency).map(([k, v]) => [k, round(v)]),
     ),
     revenue_usd_estimate: round(revenueUsd),
   };
@@ -945,8 +965,20 @@ const getProductStats = tool({
     let totalQty = 0;
     let deliveredQty = 0;
     let returnedQty = 0;
+    let totalUsd = 0;
+    let deliveredUsd = 0;
+    let returnedUsd = 0;
     const matchedCurrency: Record<string, number> = {};
+    const deliveredCurrency: Record<string, number> = {};
     for (const o of filtered) {
+      totalUsd += o.total_usd ?? 0;
+      if (o.delivered_at) deliveredUsd += o.total_usd ?? 0;
+      if (o.returned_at) returnedUsd += o.total_usd ?? 0;
+      const cur = o.currency ?? "(unknown)";
+      matchedCurrency[cur] = (matchedCurrency[cur] ?? 0) + (o.total ?? 0);
+      if (o.delivered_at) {
+        deliveredCurrency[cur] = (deliveredCurrency[cur] ?? 0) + (o.total ?? 0);
+      }
       for (const it of o.items?.data ?? []) {
         const pData = it.product?.data;
         if (!pData) continue;
@@ -957,9 +989,6 @@ const getProductStats = tool({
           totalQty += qty;
           if (o.delivered_at) deliveredQty += qty;
           if (o.returned_at) returnedQty += qty;
-          const rev = (it.price ?? 0) * qty;
-          const cur = o.currency ?? "(unknown)";
-          matchedCurrency[cur] = (matchedCurrency[cur] ?? 0) + rev;
         }
       }
     }
@@ -976,11 +1005,18 @@ const getProductStats = tool({
       delivered_count: deliveredCount,
       delivered_quantity: deliveredQty,
       avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+      delivered_revenue_usd: round(deliveredUsd),
+      avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
       returned_count: returnedCount,
       returned_quantity: returnedQty,
+      returned_revenue_usd: round(returnedUsd),
       delivery_rate_pct: filtered.length > 0 ? round((deliveredCount / filtered.length) * 100, 1) : 0,
+      revenue_usd_estimate: round(totalUsd),
       revenue_by_currency: Object.fromEntries(
         Object.entries(matchedCurrency).map(([k, v]) => [k, round(v)]),
+      ),
+      delivered_revenue_by_currency: Object.fromEntries(
+        Object.entries(deliveredCurrency).map(([k, v]) => [k, round(v)]),
       ),
       by_status: bucketBy(filtered, (o) => o.status?.label),
       pages_scanned: pagesScanned,
@@ -1020,11 +1056,15 @@ const getOrderCounts = tool({
     let totalQty = 0;
     let deliveredQty = 0;
     let returnedQty = 0;
+    let totalUsd = 0;
+    let deliveredUsd = 0;
+    let returnedUsd = 0;
     for (const o of items) {
       const qty = orderItemQty(o);
       totalQty += qty;
-      if (o.delivered_at) deliveredQty += qty;
-      if (o.returned_at) returnedQty += qty;
+      totalUsd += o.total_usd ?? 0;
+      if (o.delivered_at) { deliveredQty += qty; deliveredUsd += o.total_usd ?? 0; }
+      if (o.returned_at) { returnedQty += qty; returnedUsd += o.total_usd ?? 0; }
     }
 
     const deliveredCount = items.filter((o) => o.delivered_at).length;
@@ -1035,11 +1075,15 @@ const getOrderCounts = tool({
       total_orders: items.length,
       total_quantity: totalQty,
       avg_quantity_per_order: items.length > 0 ? round(totalQty / items.length) : 0,
+      revenue_usd_estimate: round(totalUsd),
       delivered_count: deliveredCount,
       delivered_quantity: deliveredQty,
       avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+      delivered_revenue_usd: round(deliveredUsd),
+      avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
       returned_count: returnedCount,
       returned_quantity: returnedQty,
+      returned_revenue_usd: round(returnedUsd),
       by_status: bucketBy(items, (o) => o.status?.label),
       pages_scanned: pagesScanned,
       full_range_covered: reachedCutoff,
