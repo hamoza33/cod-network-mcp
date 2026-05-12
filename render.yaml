@@ -1,0 +1,26 @@
+# Render.com Blueprint for the HTTP MCP server.
+# Use the "Deploy to Render" button in the README, or:
+# 1. Push the repo to GitHub (already done if you cloned this).
+# 2. https://dashboard.render.com -> New -> Blueprint -> point at this repo.
+# 3. Render reads render.yaml and provisions the service.
+# 4. Add the secrets COD_NETWORK_EMAIL, COD_NETWORK_PASSWORD, MCP_AUTH_TOKEN
+#    in the Render dashboard.
+
+services:
+  - type: web
+    name: cod-network-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: COD_NETWORK_EMAIL
+        sync: false
+      - key: COD_NETWORK_PASSWORD
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        generateValue: true
+      - key: NODE_ENV
+        value: production
