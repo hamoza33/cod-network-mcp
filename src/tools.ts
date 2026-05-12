@@ -304,13 +304,20 @@ interface CodOrderItem {
 
 interface CodOrder {
   id: number;
+  reference?: string;
   status?: { label?: string; code?: number };
+  customer_name?: string;
+  customer_city?: string;
   customer_country_name?: string;
   currency?: string;
   total?: number;
   total_usd?: number;
+  shipped_at?: string | null;
   delivered_at?: string | null;
   returned_at?: string | null;
+  tracking_number?: string;
+  tracking_status?: string;
+  tracking_url?: string;
   created_at?: string;
   items?: { data?: CodOrderItem[] };
 }
@@ -1125,6 +1132,117 @@ const getLeadCounts = tool({
 });
 
 /* -------------------------------------------------------------------------- */
+/*  Order tracking                                                            */
+/* -------------------------------------------------------------------------- */
+
+const getOrderTracking = tool({
+  name: "cod_get_order_tracking",
+  description:
+    "List tracking numbers and shipment details for orders, optionally filtered by product name/SKU and delivery status. " +
+    "Returns individual order rows with tracking_number, tracking_status, tracking_url, customer info, and status.",
+  inputSchema: z.object({
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter orders containing this product (case-insensitive substring match on product name)."),
+    product_sku: z
+      .string()
+      .optional()
+      .describe("Filter orders containing this product SKU (case-insensitive exact match)."),
+    status: z
+      .enum(["delivered", "undelivered", "returned", "pending", "all"])
+      .default("all")
+      .describe("Filter by delivery status. 'undelivered' = not yet delivered (includes pending, shipped, etc)."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 30 days ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .default(200)
+      .describe("Max rows to return (default 200)."),
+  }),
+  handler: async (input, client) => {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const since = toUtcStamp(input.since ?? thirtyDaysAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const { items, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, { include: "items" });
+
+    const nameLower = input.product_name?.toLowerCase();
+    const skuLower = input.product_sku?.toLowerCase();
+
+    const filtered = items.filter((o) => {
+      // Status filter
+      if (input.status === "delivered" && !o.delivered_at) return false;
+      if (input.status === "undelivered" && o.delivered_at) return false;
+      if (input.status === "returned" && !o.returned_at) return false;
+      if (input.status === "pending" && o.status?.label?.toLowerCase() !== "pending") return false;
+
+      // Product filter
+      if (nameLower || skuLower) {
+        return (o.items?.data ?? []).some((it) => {
+          const pData = it.product?.data;
+          if (!pData) return false;
+          if (skuLower && (pData.sku ?? "").toLowerCase() === skuLower) return true;
+          if (nameLower && (pData.name ?? "").toLowerCase().includes(nameLower)) return true;
+          return false;
+        });
+      }
+      return true;
+    });
+
+    const rows = filtered.slice(0, input.limit).map((o) => ({
+      order_id: o.id,
+      reference: o.reference,
+      status: o.status?.label,
+      tracking_number: o.tracking_number || null,
+      tracking_status: o.tracking_status || null,
+      tracking_url: o.tracking_url && o.tracking_url !== "#" ? o.tracking_url : null,
+      customer_name: o.customer_name,
+      customer_city: o.customer_city,
+      customer_country: o.customer_country_name,
+      shipped_at: o.shipped_at,
+      delivered_at: o.delivered_at,
+      returned_at: o.returned_at,
+      total: o.total,
+      currency: o.currency,
+      total_usd: o.total_usd,
+      created_at: o.created_at,
+      items: (o.items?.data ?? []).map((it) => ({
+        product_name: it.product?.data?.name,
+        sku: it.product?.data?.sku,
+        quantity: it.quantity,
+        price: it.price,
+      })),
+    }));
+
+    return {
+      range: { since, until },
+      filter: {
+        product_name: input.product_name,
+        product_sku: input.product_sku,
+        status: input.status,
+      },
+      total_matched: filtered.length,
+      returned_rows: rows.length,
+      orders: rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /*  Escape hatch                                                              */
 /*                                                                            */
 /*  The docs site (developer.cod.network/v2) lists pages for                  */
@@ -1184,5 +1302,6 @@ export const tools: ReadonlyArray<ToolDef> = [
   getProductStats,
   getOrderCounts,
   getLeadCounts,
+  getOrderTracking,
   rawRequest,
 ];
