@@ -458,36 +458,79 @@ function bucketKey(ts: string, bucket: "day" | "week" | "month"): string {
 
 interface OrdersAgg {
   count: number;
+  total_quantity: number;
+  avg_quantity_per_order: number;
+  delivered_count: number;
+  delivered_quantity: number;
+  avg_quantity_per_delivered_order: number;
+  delivered_revenue_usd: number;
+  avg_usd_per_delivered_order: number;
+  returned_count: number;
+  returned_quantity: number;
+  returned_revenue_usd: number;
+  delivery_rate_pct: number;
   by_status: Record<string, number>;
   by_country: Record<string, number>;
   revenue_by_currency: Record<string, number>;
+  delivered_revenue_by_currency: Record<string, number>;
   revenue_usd_estimate: number;
-  delivered_count: number;
-  returned_count: number;
-  delivery_rate_pct: number;
+}
+
+function orderItemQty(o: CodOrder): number {
+  let qty = 0;
+  for (const it of o.items?.data ?? []) qty += it.quantity ?? 0;
+  return qty;
 }
 
 function aggregateOrders(rows: CodOrder[]): OrdersAgg {
   const revenueByCurrency: Record<string, number> = {};
+  const deliveredRevByCurrency: Record<string, number> = {};
   let revenueUsd = 0;
+  let deliveredUsd = 0;
+  let returnedUsd = 0;
+  let totalQty = 0;
+  let deliveredQty = 0;
+  let returnedQty = 0;
   for (const o of rows) {
     const cur = o.currency ?? "(unknown)";
     revenueByCurrency[cur] = (revenueByCurrency[cur] ?? 0) + (o.total ?? 0);
     revenueUsd += o.total_usd ?? 0;
+    const qty = orderItemQty(o);
+    totalQty += qty;
+    if (o.delivered_at) {
+      deliveredQty += qty;
+      deliveredUsd += o.total_usd ?? 0;
+      deliveredRevByCurrency[cur] = (deliveredRevByCurrency[cur] ?? 0) + (o.total ?? 0);
+    }
+    if (o.returned_at) {
+      returnedQty += qty;
+      returnedUsd += o.total_usd ?? 0;
+    }
   }
-  const delivered = rows.filter((o) => o.delivered_at).length;
-  const returned = rows.filter((o) => o.returned_at).length;
+  const deliveredCount = rows.filter((o) => o.delivered_at).length;
+  const returnedCount = rows.filter((o) => o.returned_at).length;
   return {
     count: rows.length,
+    total_quantity: totalQty,
+    avg_quantity_per_order: rows.length > 0 ? round(totalQty / rows.length) : 0,
+    delivered_count: deliveredCount,
+    delivered_quantity: deliveredQty,
+    avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+    delivered_revenue_usd: round(deliveredUsd),
+    avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
+    returned_count: returnedCount,
+    returned_quantity: returnedQty,
+    returned_revenue_usd: round(returnedUsd),
+    delivery_rate_pct: rows.length > 0 ? round((deliveredCount / rows.length) * 100, 1) : 0,
     by_status: bucketBy(rows, (o) => o.status?.label),
     by_country: bucketBy(rows, (o) => o.customer_country_name),
     revenue_by_currency: Object.fromEntries(
       Object.entries(revenueByCurrency).map(([k, v]) => [k, round(v)]),
     ),
+    delivered_revenue_by_currency: Object.fromEntries(
+      Object.entries(deliveredRevByCurrency).map(([k, v]) => [k, round(v)]),
+    ),
     revenue_usd_estimate: round(revenueUsd),
-    delivered_count: delivered,
-    returned_count: returned,
-    delivery_rate_pct: rows.length > 0 ? round((delivered / rows.length) * 100, 1) : 0,
   };
 }
 
@@ -561,7 +604,7 @@ function aggregateLeadsByProduct(
 const summarizePeriod = tool({
   name: "cod_summarize_period",
   description:
-    "One-shot summary of leads + orders within a date range. Paginates the COD API internally and returns aggregates without forcing you to scroll raw rows. Use `bucket` for daily/weekly/monthly breakdowns (one call covers a 30-day spreadsheet). Use `group_by_product=true` to get per-product order/lead/revenue breakdowns. Use `product_query` to restrict the whole summary to rows touching a specific product (case-insensitive substring on product name).",
+    "One-shot summary of leads + orders within a date range. Paginates the COD API internally and returns aggregates (including total_quantity and avg_quantity_per_order for items) without forcing you to scroll raw rows. Use `bucket` for daily/weekly/monthly breakdowns (one call covers a 30-day spreadsheet). Use `group_by_product=true` to get per-product order/lead/revenue breakdowns. Use `product_query` to restrict the whole summary to rows touching a specific product (case-insensitive substring on product name).",
   inputSchema: z.object({
     since: z
       .string()
@@ -612,7 +655,8 @@ const summarizePeriod = tool({
 
     const wantOrders = input.include_orders !== false;
     const wantLeads = input.include_leads !== false;
-    const needItems = input.group_by_product === true || !!input.product_query;
+    // Always include items so total_quantity is accurate.
+    const needItems = true;
     const productQuery = input.product_query?.trim().toLowerCase();
 
     const [ordersResult, leadsResult] = await Promise.all([
@@ -786,6 +830,301 @@ const searchProducts = tool({
 });
 
 /* -------------------------------------------------------------------------- */
+/*  Lookup helpers                                                            */
+/* -------------------------------------------------------------------------- */
+
+const getProductBySku = tool({
+  name: "cod_get_product_by_sku",
+  description:
+    "Look up a product by its SKU. Scans the seller's catalog (and optionally drop-products) client-side because the regular products endpoint does not support server-side SKU filtering. Returns the first exact match.",
+  inputSchema: z.object({
+    sku: z.string().describe("Exact SKU to look up (case-insensitive)."),
+    include_drop_products: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Also search in the drop-products catalog."),
+    max_pages: z
+      .number()
+      .int()
+      .min(1)
+      .max(SUMMARY_MAX_PAGES)
+      .optional()
+      .default(50)
+      .describe("Max API pages to scan per catalog."),
+  }),
+  handler: async (input, client) => {
+    const needle = input.sku.trim().toLowerCase();
+    if (!needle) throw new Error("`sku` must be non-empty.");
+    const maxPages = input.max_pages ?? 50;
+
+    const scanForSku = async (
+      path: string,
+    ): Promise<{ product: CodProduct; pages_scanned: number } | null> => {
+      for (let page = 1; page <= maxPages; page += 1) {
+        const resp = await client.request<CodListResponse<CodProduct>>({
+          path,
+          query: { page, per_page: 10 },
+        });
+        const batch = resp.data ?? [];
+        if (batch.length === 0) break;
+        for (const p of batch) {
+          if ((p.sku ?? "").toLowerCase() === needle) {
+            return { product: p, pages_scanned: page };
+          }
+        }
+        const meta = resp.meta?.pagination;
+        if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
+      }
+      return null;
+    };
+
+    const result = await scanForSku("/seller/products");
+    if (result) return { ...result, source: "products" };
+
+    if (input.include_drop_products) {
+      // Drop-products endpoint supports exact `sku=` filter server-side.
+      const resp = await client.request<CodListResponse<CodProduct>>({
+        path: "/seller/drop-products",
+        query: { sku: input.sku.trim(), page: 1, per_page: 10 },
+      });
+      if (resp.data?.length) {
+        return { product: resp.data[0], pages_scanned: 1, source: "drop_products" };
+      }
+    }
+
+    return { product: null, message: `No product found with SKU "${input.sku}".` };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  Product-level analytics                                                   */
+/* -------------------------------------------------------------------------- */
+
+const getProductStats = tool({
+  name: "cod_get_product_stats",
+  description:
+    "Get order statistics for a specific product by name or SKU. Returns total orders, total quantity, revenue, delivery rate and status breakdown. Internally paginates all orders with `?include=items` and filters to the matching product.",
+  inputSchema: z.object({
+    product_name: z
+      .string()
+      .optional()
+      .describe("Case-insensitive substring matched against product name."),
+    product_sku: z
+      .string()
+      .optional()
+      .describe("Case-insensitive exact match against product SKU."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS UTC). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter orders by status (e.g. `delivered`, `shipped`)."),
+  }),
+  handler: async (input, client) => {
+    if (!input.product_name && !input.product_sku) {
+      throw new Error("Provide at least one of `product_name` or `product_sku`.");
+    }
+
+    const now = new Date();
+    const oneYearAgo = new Date(now);
+    oneYearAgo.setUTCFullYear(oneYearAgo.getUTCFullYear() - 1);
+    const since = toUtcStamp(input.since ?? oneYearAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {
+      include: "items",
+    };
+    if (input.status) queryParams.status = input.status;
+
+    const { items: orders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, queryParams);
+
+    const nameLower = input.product_name?.trim().toLowerCase();
+    const skuLower = input.product_sku?.trim().toLowerCase();
+
+    const matchesProduct = (o: CodOrder): boolean => {
+      const items = o.items?.data ?? [];
+      return items.some((it) => {
+        const pData = it.product?.data;
+        if (!pData) return false;
+        if (skuLower && (pData.sku ?? "").toLowerCase() === skuLower) return true;
+        if (nameLower && (pData.name ?? "").toLowerCase().includes(nameLower)) return true;
+        return false;
+      });
+    };
+
+    const filtered = orders.filter(matchesProduct);
+
+    let totalQty = 0;
+    let deliveredQty = 0;
+    let returnedQty = 0;
+    let totalUsd = 0;
+    let deliveredUsd = 0;
+    let returnedUsd = 0;
+    const matchedCurrency: Record<string, number> = {};
+    const deliveredCurrency: Record<string, number> = {};
+    for (const o of filtered) {
+      totalUsd += o.total_usd ?? 0;
+      if (o.delivered_at) deliveredUsd += o.total_usd ?? 0;
+      if (o.returned_at) returnedUsd += o.total_usd ?? 0;
+      const cur = o.currency ?? "(unknown)";
+      matchedCurrency[cur] = (matchedCurrency[cur] ?? 0) + (o.total ?? 0);
+      if (o.delivered_at) {
+        deliveredCurrency[cur] = (deliveredCurrency[cur] ?? 0) + (o.total ?? 0);
+      }
+      for (const it of o.items?.data ?? []) {
+        const pData = it.product?.data;
+        if (!pData) continue;
+        const skuMatch = skuLower && (pData.sku ?? "").toLowerCase() === skuLower;
+        const nameMatch = nameLower && (pData.name ?? "").toLowerCase().includes(nameLower);
+        if (skuMatch || nameMatch) {
+          const qty = it.quantity ?? 0;
+          totalQty += qty;
+          if (o.delivered_at) deliveredQty += qty;
+          if (o.returned_at) returnedQty += qty;
+        }
+      }
+    }
+
+    const deliveredCount = filtered.filter((o) => o.delivered_at).length;
+    const returnedCount = filtered.filter((o) => o.returned_at).length;
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name, product_sku: input.product_sku, status: input.status },
+      orders: filtered.length,
+      total_quantity: totalQty,
+      avg_quantity_per_order: filtered.length > 0 ? round(totalQty / filtered.length) : 0,
+      delivered_count: deliveredCount,
+      delivered_quantity: deliveredQty,
+      avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+      delivered_revenue_usd: round(deliveredUsd),
+      avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
+      returned_count: returnedCount,
+      returned_quantity: returnedQty,
+      returned_revenue_usd: round(returnedUsd),
+      delivery_rate_pct: filtered.length > 0 ? round((deliveredCount / filtered.length) * 100, 1) : 0,
+      revenue_usd_estimate: round(totalUsd),
+      revenue_by_currency: Object.fromEntries(
+        Object.entries(matchedCurrency).map(([k, v]) => [k, round(v)]),
+      ),
+      delivered_revenue_by_currency: Object.fromEntries(
+        Object.entries(deliveredCurrency).map(([k, v]) => [k, round(v)]),
+      ),
+      by_status: bucketBy(filtered, (o) => o.status?.label),
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  Quick counts                                                              */
+/* -------------------------------------------------------------------------- */
+
+const getOrderCounts = tool({
+  name: "cod_get_order_counts",
+  description:
+    "Quick count of orders by status for a date range, without returning raw order data. Much faster than `cod_summarize_period` when you only need counts.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 30 days ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+  }),
+  handler: async (input, client) => {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const since = toUtcStamp(input.since ?? thirtyDaysAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const { items, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, { include: "items" });
+
+    let totalQty = 0;
+    let deliveredQty = 0;
+    let returnedQty = 0;
+    let totalUsd = 0;
+    let deliveredUsd = 0;
+    let returnedUsd = 0;
+    for (const o of items) {
+      const qty = orderItemQty(o);
+      totalQty += qty;
+      totalUsd += o.total_usd ?? 0;
+      if (o.delivered_at) { deliveredQty += qty; deliveredUsd += o.total_usd ?? 0; }
+      if (o.returned_at) { returnedQty += qty; returnedUsd += o.total_usd ?? 0; }
+    }
+
+    const deliveredCount = items.filter((o) => o.delivered_at).length;
+    const returnedCount = items.filter((o) => o.returned_at).length;
+
+    return {
+      range: { since, until },
+      total_orders: items.length,
+      total_quantity: totalQty,
+      avg_quantity_per_order: items.length > 0 ? round(totalQty / items.length) : 0,
+      revenue_usd_estimate: round(totalUsd),
+      delivered_count: deliveredCount,
+      delivered_quantity: deliveredQty,
+      avg_quantity_per_delivered_order: deliveredCount > 0 ? round(deliveredQty / deliveredCount) : 0,
+      delivered_revenue_usd: round(deliveredUsd),
+      avg_usd_per_delivered_order: deliveredCount > 0 ? round(deliveredUsd / deliveredCount) : 0,
+      returned_count: returnedCount,
+      returned_quantity: returnedQty,
+      returned_revenue_usd: round(returnedUsd),
+      by_status: bucketBy(items, (o) => o.status?.label),
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+const getLeadCounts = tool({
+  name: "cod_get_lead_counts",
+  description:
+    "Quick count of leads by status for a date range. Faster than a full summarize call when you only need lead metrics.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 30 days ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+  }),
+  handler: async (input, client) => {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const since = toUtcStamp(input.since ?? thirtyDaysAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const { items, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodLead>(client, "/seller/leads", since, until, {});
+
+    return {
+      range: { since, until },
+      ...aggregateLeads(items),
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 /*  Escape hatch                                                              */
 /*                                                                            */
 /*  The docs site (developer.cod.network/v2) lists pages for                  */
@@ -828,6 +1167,7 @@ const rawRequest = tool({
 export const tools: ReadonlyArray<ToolDef> = [
   listProducts,
   getProduct,
+  getProductBySku,
   listDropProducts,
   getDropProduct,
   listStocks,
@@ -841,5 +1181,8 @@ export const tools: ReadonlyArray<ToolDef> = [
   listSourceRequests,
   summarizePeriod,
   searchProducts,
+  getProductStats,
+  getOrderCounts,
+  getLeadCounts,
   rawRequest,
 ];

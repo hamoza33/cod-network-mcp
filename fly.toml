@@ -1,6 +1,6 @@
 # Fly.io app config for cod-network-mcp HTTP server.
 # Deploy with: `flyctl launch --no-deploy` (first time, to claim the app name)
-# then: `flyctl secrets set COD_NETWORK_EMAIL=... COD_NETWORK_PASSWORD=... MCP_AUTH_TOKEN=$(openssl rand -base64 32)`
+# then: `flyctl secrets set COD_NETWORK_API_TOKEN=your-token MCP_AUTH_TOKEN=$(openssl rand -base64 32)`
 # then: `flyctl deploy`.
 
 app = "cod-network-mcp"
