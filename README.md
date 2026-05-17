@@ -18,6 +18,7 @@ an LLM can answer questions like:
 | --------------------------------- | ------------------------------------- |
 | `cod_list_products`               | `GET /seller/products`                |
 | `cod_get_product`                 | `GET /seller/products/{id}`           |
+| `cod_get_product_by_sku`          | look up a product by exact SKU        |
 | `cod_list_drop_products`          | `GET /seller/drop-products`           |
 | `cod_get_drop_product`            | `GET /seller/drop-products/{id}`      |
 | `cod_list_stocks`                 | `GET /seller/stocks`                  |
@@ -29,18 +30,25 @@ an LLM can answer questions like:
 | `cod_list_invoices`               | `GET /seller/invoices`                |
 | `cod_get_invoice`                 | `GET /seller/invoices/{id}`           |
 | `cod_list_source_requests`        | `GET /seller/source-requests`         |
-| `cod_summarize_period`            | aggregates orders + leads in one call (paginates internally) |
+| `cod_summarize_period`            | aggregates orders + leads in one call (includes total quantity) |
 | `cod_search_products`             | substring search on name/SKU across products + drop-products |
+| `cod_get_product_stats`           | order stats for a specific product (by name or SKU) |
+| `cod_get_order_counts`            | quick order counts by status for a date range |
+| `cod_get_lead_counts`             | quick lead counts by status for a date range |
 | `cod_raw_request`                 | any documented endpoint (escape hatch) |
 
 ### Aggregation tools
 
 The COD API caps `per_page` at 10 and silently ignores arbitrary date / name
-filters, which makes naïve LLM workflows extremely chatty. The two aggregation
+filters, which makes naïve LLM workflows extremely chatty. The aggregation
 tools handle pagination and filtering server-side:
 
-- **`cod_summarize_period({ since, until?, bucket?, group_by_product?, product_query?, include_examples? })`** — returns a compact JSON with totals, by-status, by-country, revenue per currency, confirmation/delivery rates. Set `bucket: "day" | "week" | "month"` to also get a `series` array (e.g. one row per day for a 30-day spreadsheet). Set `group_by_product: true` to add `by_product` breakdowns. Set `product_query` to limit the whole summary to rows touching a specific product.
+- **`cod_summarize_period({ since, until?, bucket?, group_by_product?, product_query?, include_examples? })`** — returns a compact JSON with totals, **total quantity, average quantity per order**, by-status, by-country, revenue per currency, confirmation/delivery rates. Set `bucket: "day" | "week" | "month"` to also get a `series` array (e.g. one row per day for a 30-day spreadsheet). Set `group_by_product: true` to add `by_product` breakdowns. Set `product_query` to limit the whole summary to rows touching a specific product.
 - **`cod_search_products({ query, kind?, limit? })`** — case-insensitive substring search on name/SKU across the seller's owned catalog (`kind: "products"`), the dropshipping catalog (`kind: "drop_products"`), or both. Paginates client-side because the COD `name=` / `q=` filters either don't match or only do exact-match.
+- **`cod_get_product_by_sku({ sku })`** — exact SKU lookup across the seller's catalog (and optionally drop-products).
+- **`cod_get_product_stats({ product_name?, product_sku?, since?, until? })`** — per-product order stats: total orders, **total quantity delivered**, average quantity per order, revenue, delivery rate, status breakdown.
+- **`cod_get_order_counts({ since?, until? })`** — quick order count by status + total quantity for a date range.
+- **`cod_get_lead_counts({ since?, until? })`** — quick lead count by status for a date range.
 
 > The docs at developer.cod.network/v2 also list pages for *Confirmed
 > Dashboard*, *Delivered Dashboard*, *Statistics*, *Purchases* and
@@ -54,17 +62,8 @@ parameters.
 
 ## Authentication
 
-Provide **one** of these:
-
-1. **Static API token** — set `COD_NETWORK_API_TOKEN`. Get it from the seller
-   dashboard: **My profile → API developer → API Token**.
-2. **Auto-login (recommended for long-running servers)** — set
-   `COD_NETWORK_EMAIL` + `COD_NETWORK_PASSWORD`. The server calls
-   `POST /seller/login` on first use and refreshes the token automatically when
-   the API returns `401 expired_token`.
-
-If both are set, the static token is tried first and email/password is used as
-a fallback on expiry.
+Set `COD_NETWORK_API_TOKEN` with your bearer token from the seller dashboard:
+**My profile → API developer → API Token**.
 
 ## Install & run locally
 
@@ -154,8 +153,7 @@ or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
       "command": "npx",
       "args": ["-y", "cod-network-mcp"],
       "env": {
-        "COD_NETWORK_EMAIL": "you@example.com",
-        "COD_NETWORK_PASSWORD": "your-password"
+        "COD_NETWORK_API_TOKEN": "paste-your-token-here"
       }
     }
   }
@@ -198,9 +196,7 @@ Replace the `command`/`args` pair with:
 
 | Env var                 | Required                     | Description                                                                |
 | ----------------------- | ---------------------------- | -------------------------------------------------------------------------- |
-| `COD_NETWORK_API_TOKEN` | one of token / email+pw      | Bearer token from the seller dashboard.                                    |
-| `COD_NETWORK_EMAIL`     | one of token / email+pw      | Seller account email (used with `COD_NETWORK_PASSWORD` for auto-login).    |
-| `COD_NETWORK_PASSWORD`  | one of token / email+pw      | Seller account password.                                                   |
+| `COD_NETWORK_API_TOKEN` | **yes**                      | Bearer token from the seller dashboard.                                    |
 | `COD_NETWORK_BASE_URL`  | no                           | Override base URL. Defaults to `https://api.cod.network/v2`.               |
 | `COD_NETWORK_TIMEOUT_MS`| no                           | HTTP timeout in milliseconds. Defaults to `30000`.                         |
 | `MCP_AUTH_TOKEN`        | HTTP entrypoint only         | Doubles as: (1) admin Bearer token for `curl` / Claude Desktop, (2) the password the OAuth login page asks for. **Set this in production.** |
@@ -218,8 +214,7 @@ The HTTP entrypoint (`dist/http.js`) is a standalone Express app on port
 ```bash
 flyctl launch --no-deploy                # claim the app name
 flyctl secrets set \
-  COD_NETWORK_EMAIL=you@example.com \
-  COD_NETWORK_PASSWORD=your-password \
+  COD_NETWORK_API_TOKEN=your-token \
   MCP_AUTH_TOKEN="$(openssl rand -base64 32)" \
   MCP_PUBLIC_URL=https://your-app-name.fly.dev
 flyctl deploy
@@ -234,15 +229,14 @@ You'll get a URL like `https://your-app-name.fly.dev/mcp`. Use that as the
 Push this repo to GitHub, then Render Dashboard → **New → Blueprint** → point at
 the repo. Render reads [`render.yaml`](render.yaml), provisions a Docker web
 service on the free plan, generates `MCP_AUTH_TOKEN` automatically, and
-prompts you to fill in `COD_NETWORK_EMAIL` / `COD_NETWORK_PASSWORD`.
+prompts you to fill in `COD_NETWORK_API_TOKEN`.
 
 ### Any Docker host
 
 ```bash
 docker build -t cod-network-mcp .
 docker run --rm -p 8080:8080 \
-  -e COD_NETWORK_EMAIL=you@example.com \
-  -e COD_NETWORK_PASSWORD=your-password \
+  -e COD_NETWORK_API_TOKEN=your-token \
   -e MCP_AUTH_TOKEN="$(openssl rand -base64 32)" \
   cod-network-mcp
 ```
@@ -253,8 +247,7 @@ docker run --rm -p 8080:8080 \
 npm install && npm run build
 PORT=8765 \
   MCP_PUBLIC_URL=http://127.0.0.1:8765 \
-  COD_NETWORK_EMAIL=you@example.com \
-  COD_NETWORK_PASSWORD=your-password \
+  COD_NETWORK_API_TOKEN=your-token \
   MCP_AUTH_TOKEN=dev-token \
   node dist/http.js
 # Admin / curl mode:
@@ -280,7 +273,7 @@ node scripts/smoke.mjs cod_list_products   # quick local smoke test
 
 The smoke script spawns the built server, runs `initialize` + `tools/list`,
 then calls one tool by name (default `cod_list_stores`) and prints the result.
-It expects `COD_NETWORK_API_TOKEN` (or email/password) in the environment.
+It expects `COD_NETWORK_API_TOKEN` in the environment.
 
 ## Security
 
