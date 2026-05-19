@@ -62,8 +62,39 @@ parameters.
 
 ## Authentication
 
-Set `COD_NETWORK_API_TOKEN` with your bearer token from the seller dashboard:
-**My profile → API developer → API Token**.
+The **only** way to connect to the COD Network API is via a **bearer token**
+(no OAuth, no username/password). You generate it once in the seller dashboard
+and pass it as the `COD_NETWORK_API_TOKEN` environment variable.
+
+### How to get your token
+
+1. Log in to [cod.network](https://cod.network) with your seller account.
+2. Go to **My profile → API developer → API Token**.
+3. Copy the token.
+
+### How to set / update it
+
+Set it as an environment variable before starting the server:
+
+```bash
+export COD_NETWORK_API_TOKEN="your-token-here"
+```
+
+Or pass it inline when running:
+
+```bash
+COD_NETWORK_API_TOKEN="your-token-here" node dist/server.js
+```
+
+For MCP client configs (ChatGPT Desktop, Claude Desktop, Cursor, etc.), paste
+the token in the `"env"` block — see [Connect it to a client](#connect-it-to-a-client) below.
+
+For hosted deployments (Fly.io, Render, Docker), set it as a server secret /
+environment variable — see [Deploy the HTTP server](#deploy-the-http-server).
+
+> **To rotate or update the token**, generate a new one from the same dashboard
+> page and replace the old value wherever you set it (env var, MCP config, or
+> hosting secret). No code changes are needed.
 
 ## Install & run locally
 
