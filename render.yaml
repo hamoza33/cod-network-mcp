@@ -18,6 +18,6 @@ services:
       - key: COD_NETWORK_API_TOKEN
         sync: false
       - key: MCP_AUTH_TOKEN
-        generateValue: true
+        sync: false
       - key: NODE_ENV
         value: production
