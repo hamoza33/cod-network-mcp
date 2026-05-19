@@ -84,7 +84,7 @@ async function main(): Promise<void> {
         issuerUrl,
       ).toString(),
       protectedResourceMetadata: getOAuthProtectedResourceMetadataUrl(mcpResourceUrl),
-      docs: "https://github.com/hamoza33/cod-network-mcp",
+      docs: "https://github.com/user/cod-network-mcp",
     });
   });
 
