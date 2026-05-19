@@ -354,7 +354,7 @@ export class CodMcpOAuthProvider implements OAuthServerProvider {
       <input id="admin_token" type="password" name="admin_token" autocomplete="current-password" autofocus required />
       <button type="submit">Authorize</button>
     </form>
-    <p class="footer">cod-network-mcp · <a href="https://github.com/hamoza33/cod-network-mcp">source</a></p>
+    <p class="footer">cod-network-mcp · <a href="https://github.com/user/cod-network-mcp">source</a></p>
   </main>
 </body>
 </html>`;
