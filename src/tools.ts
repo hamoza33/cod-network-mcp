@@ -296,6 +296,13 @@ const listSourceRequests = tool({
  */
 const SUMMARY_MAX_PAGES = 200;
 
+/**
+ * Number of pages fetched concurrently inside `paginateInRange`. Higher values
+ * reduce wall-clock time dramatically when the date range spans many pages
+ * (COD caps per_page at 10 so even moderate ranges need dozens of pages).
+ */
+const PAGE_CONCURRENCY = 5;
+
 interface CodOrderItem {
   quantity?: number;
   price?: number;
@@ -309,6 +316,7 @@ interface CodOrder {
   customer_name?: string;
   customer_city?: string;
   customer_country_name?: string;
+  customer_phone?: string;
   currency?: string;
   total?: number;
   total_usd?: number;
@@ -379,32 +387,57 @@ async function paginateInRange<T extends { created_at?: string }>(
   const items: T[] = [];
   let page = 1;
   let reachedCutoff = false;
-  while (page <= SUMMARY_MAX_PAGES) {
-    const resp = await client.request<CodListResponse<T>>({
-      path,
-      query: { ...query, page, per_page: 10, sort: "-created_at" },
-    });
-    const batch = resp.data ?? [];
-    if (batch.length === 0) break;
-    for (const row of batch) {
-      const ts = row.created_at ?? "";
-      if (ts >= until) continue;
-      if (ts < since) {
+  let knownTotalPages = Infinity;
+
+  while (page <= SUMMARY_MAX_PAGES && page <= knownTotalPages && !reachedCutoff) {
+    const batchSize = Math.min(
+      PAGE_CONCURRENCY,
+      SUMMARY_MAX_PAGES - page + 1,
+      knownTotalPages - page + 1,
+    );
+    const pageNums = Array.from({ length: batchSize }, (_, i) => page + i);
+
+    const responses = await Promise.all(
+      pageNums.map((p) =>
+        client.request<CodListResponse<T>>({
+          path,
+          query: { ...query, page: p, per_page: 10, sort: "-created_at" },
+        }),
+      ),
+    );
+
+    for (const resp of responses) {
+      const batch = resp.data ?? [];
+      if (batch.length === 0) {
         reachedCutoff = true;
         break;
       }
-      items.push(row);
+
+      const meta = resp.meta?.pagination;
+      if (meta?.total_pages !== undefined && meta.total_pages < knownTotalPages) {
+        knownTotalPages = meta.total_pages;
+      }
+
+      for (const row of batch) {
+        const ts = row.created_at ?? "";
+        if (ts >= until) continue;
+        if (ts < since) {
+          reachedCutoff = true;
+          break;
+        }
+        items.push(row);
+      }
+      if (reachedCutoff) break;
     }
-    // Newest first means once we cross `since` we're done.
-    if (reachedCutoff) break;
-    // Defensive stop if API runs out.
-    const meta = resp.meta?.pagination;
-    if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
-    page += 1;
+
+    page += pageNums.length;
   }
-  // `page` is already incremented past the last fetched page when the loop
-  // hits SUMMARY_MAX_PAGES; clamp so the count reflects actual API calls.
-  return { items, pagesScanned: Math.min(page, SUMMARY_MAX_PAGES), reachedCutoff };
+
+  return {
+    items,
+    pagesScanned: Math.min(page - 1, SUMMARY_MAX_PAGES),
+    reachedCutoff,
+  };
 }
 
 function bucketBy<T>(rows: T[], key: (r: T) => string | undefined): Record<string, number> {
@@ -1211,6 +1244,7 @@ const getOrderTracking = tool({
       customer_name: o.customer_name,
       customer_city: o.customer_city,
       customer_country: o.customer_country_name,
+      customer_phone: o.customer_phone || null,
       shipped_at: o.shipped_at,
       delivered_at: o.delivered_at,
       returned_at: o.returned_at,
