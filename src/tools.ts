@@ -26,6 +26,15 @@ const Pagination = {
     .describe(
       "Items per page (max 100, default 10). The tool internally paginates through the API to collect this many items. For example, per_page=100 fetches 10 internal API pages and returns 100 items. May take a few seconds for large values.",
     ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe(
+      "Alias for `per_page`. If both are provided, `per_page` takes priority.",
+    ),
 };
 
 const Sort = {
