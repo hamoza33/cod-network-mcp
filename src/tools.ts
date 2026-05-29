@@ -21,10 +21,10 @@ const Pagination = {
     .number()
     .int()
     .min(1)
-    .max(10)
+    .max(500)
     .optional()
     .describe(
-      "Items per page. The API silently caps this at 10 even if a higher value is requested, so iterate with `page` to fetch more than 10 results.",
+      "Items per page (max 500). Defaults to 10 if omitted.",
     ),
 };
 
@@ -166,7 +166,7 @@ const listStocks = tool({
 const listOrders = tool({
   name: "cod_list_orders",
   description:
-    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. To answer date-bounded questions (e.g. 'orders last week'), page through results until the `created_at` field is older than the desired range and aggregate client-side: the API ignores arbitrary date filters and caps `per_page` at 10.",
+    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Supports up to 500 items per page via `per_page`. To answer date-bounded questions (e.g. 'orders last week'), page through results until the `created_at` field is older than the desired range and aggregate client-side.",
   inputSchema: z.object({
     status: z
       .string()
@@ -204,7 +204,7 @@ const getOrder = tool({
 const listLeads = tool({
   name: "cod_list_leads",
   description:
-    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Same pagination caveats as `cod_list_orders`: page through results to handle date ranges client-side; `per_page` is capped at 10.",
+    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Supports up to 500 items per page via `per_page`.",
   inputSchema: z.object({
     status: z
       .string()
@@ -249,7 +249,7 @@ const listStores = tool({
 const listInvoices = tool({
   name: "cod_list_invoices",
   description:
-    "List the seller's invoices (remittance / payouts), newest first. Page through results to filter by date client-side; `per_page` is capped at 10.",
+    "List the seller's invoices (remittance / payouts), newest first. Supports up to 500 items per page via `per_page`.",
   inputSchema: z.object({
     status: z
       .string()
@@ -299,7 +299,8 @@ const SUMMARY_MAX_PAGES = 200;
 /**
  * Number of pages fetched concurrently inside `paginateInRange`. Higher values
  * reduce wall-clock time dramatically when the date range spans many pages
- * (COD caps per_page at 10 so even moderate ranges need dozens of pages).
+ * The API supports up to 500 per page, dramatically reducing the number of
+ * requests needed for large date ranges.
  */
 const PAGE_CONCURRENCY = 5;
 
@@ -401,7 +402,7 @@ async function paginateInRange<T extends { created_at?: string }>(
       pageNums.map((p) =>
         client.request<CodListResponse<T>>({
           path,
-          query: { ...query, page: p, per_page: 10, sort: "-created_at" },
+          query: { ...query, page: p, per_page: 500, sort: "-created_at" },
         }),
       ),
     );
@@ -832,7 +833,7 @@ const searchProducts = tool({
       for (let page = 1; page <= maxPages && matches.length < limit; page += 1) {
         const resp = await client.request<CodListResponse<CodProduct>>({
           path,
-          query: { page, per_page: 10 },
+          query: { page, per_page: 500 },
         });
         pagesScanned = page;
         const batch = resp.data ?? [];
@@ -904,7 +905,7 @@ const getProductBySku = tool({
       for (let page = 1; page <= maxPages; page += 1) {
         const resp = await client.request<CodListResponse<CodProduct>>({
           path,
-          query: { page, per_page: 10 },
+          query: { page, per_page: 500 },
         });
         const batch = resp.data ?? [];
         if (batch.length === 0) break;
@@ -926,7 +927,7 @@ const getProductBySku = tool({
       // Drop-products endpoint supports exact `sku=` filter server-side.
       const resp = await client.request<CodListResponse<CodProduct>>({
         path: "/seller/drop-products",
-        query: { sku: input.sku.trim(), page: 1, per_page: 10 },
+        query: { sku: input.sku.trim(), page: 1, per_page: 500 },
       });
       if (resp.data?.length) {
         return { product: resp.data[0], pages_scanned: 1, source: "drop_products" };
