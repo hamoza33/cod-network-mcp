@@ -12,14 +12,16 @@
  * the static `MCP_AUTH_TOKEN` itself is also accepted as a Bearer token on
  * `/mcp`.
  *
- * Stateless mode: every POST /mcp spins up a fresh server+transport and tears
- * them down when the request closes. This works well for serverless and small
- * VMs and avoids long-lived connection state.
+ * Stateful mode: sessions are tracked via Mcp-Session-Id headers so that
+ * multi-request flows (initialize → tools/list → tools/call) work across
+ * separate HTTP requests, which is required by ChatGPT and most MCP clients.
  */
 
+import { randomUUID } from "node:crypto";
 import express from "express";
-import type { Request, RequestHandler, Response } from "express";
+import type { Request, RequestHandler } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   getOAuthProtectedResourceMetadataUrl,
   mcpAuthRouter,
@@ -33,15 +35,38 @@ const log = (...args: unknown[]): void => {
   process.stderr.write(`[cod-network-mcp:http] ${args.join(" ")}\n`);
 };
 
-function methodNotAllowed(res: Response): void {
-  res.writeHead(405, { "content-type": "application/json" }).end(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed." },
-      id: null,
-    }),
-  );
+/* ------------------------------------------------------------------ */
+/*  Session management                                                */
+/* ------------------------------------------------------------------ */
+
+interface McpSession {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  lastUsed: number;
 }
+
+const sessions = new Map<string, McpSession>();
+
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function gcSessions(): void {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.lastUsed > SESSION_TTL_MS) {
+      sessions.delete(id);
+      void session.transport.close().catch(() => {});
+      void session.server.close().catch(() => {});
+      log(`session ${id} expired`);
+    }
+  }
+}
+
+const gcTimer = setInterval(gcSessions, 5 * 60 * 1000);
+gcTimer.unref(); // don't keep the process alive just for GC
+
+/* ------------------------------------------------------------------ */
+/*  Main                                                              */
+/* ------------------------------------------------------------------ */
 
 async function main(): Promise<void> {
   const cfg = readCodConfig();
@@ -84,7 +109,7 @@ async function main(): Promise<void> {
         issuerUrl,
       ).toString(),
       protectedResourceMetadata: getOAuthProtectedResourceMetadataUrl(mcpResourceUrl),
-      docs: "https://github.com/user/cod-network-mcp",
+      docs: "https://github.com/hamoza33/cod-network-mcp",
     });
   });
 
@@ -128,18 +153,79 @@ async function main(): Promise<void> {
     oauthBearer(req, res, next);
   };
 
-  app.post("/mcp", adminOrOauthBearer, async (req, res) => {
+  /* ---------------------------------------------------------------- */
+  /*  MCP endpoint — POST, GET (SSE), DELETE                          */
+  /* ---------------------------------------------------------------- */
+
+  const mcpHandler: RequestHandler = async (req, res) => {
+    // Check for an existing session.
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+    if (sessionId) {
+      const session = sessions.get(sessionId);
+      if (session) {
+        session.lastUsed = Date.now();
+        try {
+          await session.transport.handleRequest(req, res, req.body);
+        } catch (err) {
+          log(
+            "error handling /mcp:",
+            err instanceof Error ? err.stack ?? err.message : String(err),
+          );
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: "2.0",
+              error: { code: -32603, message: "Internal server error" },
+              id: null,
+            });
+          }
+        }
+        return;
+      }
+      // Unknown session — for POST we fall through and create a new one if
+      // the body is an initialize request (the transport validates this).
+      // For GET/DELETE with a stale session, return 404.
+      if (req.method !== "POST") {
+        res.status(404).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Session not found" },
+          id: null,
+        });
+        return;
+      }
+    }
+
+    // Only POST can start a new session (must contain an initialize request).
+    if (req.method !== "POST") {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Bad Request: No active session. Send an initialize request via POST first.",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    // Spin up a new MCP server + stateful transport for this session.
     const { server } = buildMcpServer(cfg);
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newId: string) => {
+        sessions.set(newId, { server, transport, lastUsed: Date.now() });
+        log(`session ${newId} created (active: ${sessions.size})`);
+      },
     });
 
-    res.on("close", () => {
-      // close() is async; swallow rejections so a transport-already-closed
-      // race doesn't surface as an unhandledRejection and crash the process.
-      void transport.close().catch(() => {});
+    transport.onclose = () => {
+      const id = transport.sessionId;
+      if (id) {
+        sessions.delete(id);
+        log(`session ${id} closed (active: ${sessions.size})`);
+      }
       void server.close().catch(() => {});
-    });
+    };
 
     try {
       await server.connect(transport);
@@ -156,12 +242,14 @@ async function main(): Promise<void> {
           id: null,
         });
       }
+      void transport.close().catch(() => {});
+      void server.close().catch(() => {});
     }
-  });
+  };
 
-  // GET / DELETE on /mcp are not used in stateless mode.
-  app.get("/mcp", (_req, res) => methodNotAllowed(res));
-  app.delete("/mcp", (_req, res) => methodNotAllowed(res));
+  app.post("/mcp", adminOrOauthBearer, mcpHandler);
+  app.get("/mcp", adminOrOauthBearer, mcpHandler);
+  app.delete("/mcp", adminOrOauthBearer, mcpHandler);
 
   app.listen(port, host, () => {
     log(`listening on http://${host}:${port}`);
