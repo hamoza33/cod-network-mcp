@@ -108,6 +108,8 @@ interface CodListResponse<T> {
  * internally fetches multiple API pages to fill the requested page size, and
  * uses the caller's `page` to compute the correct offset.
  *
+ * Also accepts `limit` as a backward-compatible alias for `per_page`.
+ *
  * Example: per_page=100, page=2 → fetches API pages 11-20 (items 101-200).
  */
 async function fetchWithPagination<T>(
@@ -115,18 +117,27 @@ async function fetchWithPagination<T>(
   path: string,
   input: Record<string, unknown>,
 ): Promise<unknown> {
-  const requestedPerPage = typeof input.per_page === "number" ? input.per_page : 10;
+  // Accept `limit` as backward-compat alias for `per_page`.
+  const rawPerPage = typeof input.per_page === "number"
+    ? input.per_page
+    : typeof input.limit === "number"
+      ? input.limit
+      : 10;
+  const requestedPerPage = Math.min(rawPerPage, 100);
   const requestedPage = typeof input.page === "number" ? input.page : 1;
 
   if (requestedPerPage <= API_PAGE_SIZE) {
-    // No internal pagination needed — pass through directly.
-    return client.request({ path, query: q(input) });
+    // No internal pagination needed — pass through directly (strip limit).
+    const passQuery = q(input);
+    delete passQuery.limit;
+    return client.request({ path, query: passQuery });
   }
 
-  // Strip page/per_page from query — we manage them internally.
+  // Strip page/per_page/limit from query — we manage them internally.
   const query = q(input);
   delete query.page;
   delete query.per_page;
+  delete query.limit;
 
   const internalPagesNeeded = Math.ceil(requestedPerPage / API_PAGE_SIZE);
   const startApiPage = (requestedPage - 1) * internalPagesNeeded + 1;
@@ -237,10 +248,61 @@ const listStocks = tool({
 /*  Orders & leads                                                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Strip an order down to essential fields for compact mode.
+ * Keeps: id, reference, status, customer info, totals, dates, tracking, items
+ * summary. Drops: large HTML descriptions, nested product blobs, media, etc.
+ */
+function compactOrder(order: Record<string, unknown>): Record<string, unknown> {
+  const items = order.items as { data?: Record<string, unknown>[] } | undefined;
+  const compactItems = items?.data?.map((item: Record<string, unknown>) => {
+    const product = item.product as { data?: Record<string, unknown> } | undefined;
+    return {
+      quantity: item.quantity,
+      price: item.price,
+      product_id: product?.data?.id,
+      product_name: product?.data?.name,
+      product_sku: product?.data?.sku,
+    };
+  });
+
+  const customer = order.customer as { data?: Record<string, unknown> } | undefined;
+  const compactCustomer = customer?.data
+    ? {
+        name: customer.data.name,
+        phone: customer.data.phone,
+        city: customer.data.city,
+        country: customer.data.country_name ?? customer.data.country,
+      }
+    : undefined;
+
+  return {
+    id: order.id,
+    reference: order.reference,
+    status: order.status,
+    customer_name: order.customer_name ?? compactCustomer?.name,
+    customer_phone: order.customer_phone ?? compactCustomer?.phone,
+    customer_city: order.customer_city ?? compactCustomer?.city,
+    customer_country: order.customer_country_name ?? compactCustomer?.country,
+    total: order.total,
+    total_usd: order.total_usd,
+    currency: order.currency,
+    tracking_number: order.tracking_number,
+    tracking_status: order.tracking_status,
+    tracking_url: order.tracking_url,
+    shipped_at: order.shipped_at,
+    delivered_at: order.delivered_at,
+    returned_at: order.returned_at,
+    created_at: order.created_at,
+    ...(compactItems ? { items: compactItems } : {}),
+    ...(compactCustomer && !order.customer_name ? { customer: compactCustomer } : {}),
+  };
+}
+
 const listOrders = tool({
   name: "cod_list_orders",
   description:
-    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Use `per_page` (up to 100) to get more items per page (may take a few seconds). Use `page` to paginate through all results.",
+    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Use `per_page` (up to 100) to get more items per page (may take a few seconds). Use `page` to paginate through all results. Set `compact: true` (recommended for large fetches) to strip heavy fields like product descriptions and keep only essential order data — this dramatically reduces response size.",
   inputSchema: z.object({
     status: z
       .string()
@@ -253,12 +315,26 @@ const listOrders = tool({
       .string()
       .optional()
       .describe("Filter by customer phone number (best-effort match)."),
+    compact: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        "When true (default), strips large nested objects (product descriptions, HTML, media) and returns only essential fields per order. Set to false for full API response.",
+      ),
     ...Includes,
     ...Pagination,
     ...Sort,
   }),
-  handler: (input, client) =>
-    fetchWithPagination(client, "/seller/orders", input),
+  handler: async (input, client) => {
+    const compact = input.compact !== false;
+    const { compact: _compact, ...rest } = input;
+    const result = await fetchWithPagination(client, "/seller/orders", rest) as Record<string, unknown>;
+    if (!compact) return result;
+    const data = result.data as Record<string, unknown>[] | undefined;
+    if (!data) return result;
+    return { ...result, data: data.map(compactOrder) };
+  },
 });
 
 const getOrder = tool({
@@ -278,19 +354,33 @@ const getOrder = tool({
 const listLeads = tool({
   name: "cod_list_leads",
   description:
-    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Use `per_page` (up to 100) to get more items per page.",
+    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Use `per_page` (up to 100) to get more items per page. Set `compact: true` (recommended) to reduce response size.",
   inputSchema: z.object({
     status: z
       .string()
       .optional()
       .describe("Filter by lead status (e.g. `new`, `confirmed`, `cancelled`)."),
     customer_phone: z.string().optional(),
+    compact: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        "When true (default), strips large nested objects and returns only essential fields.",
+      ),
     ...Includes,
     ...Pagination,
     ...Sort,
   }),
-  handler: (input, client) =>
-    fetchWithPagination(client, "/seller/leads", input),
+  handler: async (input, client) => {
+    const compact = input.compact !== false;
+    const { compact: _compact, ...rest } = input;
+    const result = await fetchWithPagination(client, "/seller/leads", rest) as Record<string, unknown>;
+    if (!compact) return result;
+    const data = result.data as Record<string, unknown>[] | undefined;
+    if (!data) return result;
+    return { ...result, data: data.map(compactOrder) };
+  },
 });
 
 const getLead = tool({
