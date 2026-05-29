@@ -16,24 +16,15 @@ import type { CodClient } from "./client.js";
 /* -------------------------------------------------------------------------- */
 
 const Pagination = {
-  page: z.number().int().min(1).optional().describe("Page number (1-based). Ignored when `limit` is set."),
+  page: z.number().int().min(1).optional().describe("Page number (1-based). Each page returns `per_page` items."),
   per_page: z
-    .number()
-    .int()
-    .min(1)
-    .max(10)
-    .optional()
-    .describe(
-      "Items per page (API maximum is 10). Ignored when `limit` is set.",
-    ),
-  limit: z
     .number()
     .int()
     .min(1)
     .max(100)
     .optional()
     .describe(
-      "Total number of items to return (max 100). When set, the tool automatically paginates through multiple API pages (10 items each) to collect up to this many results. May take a few seconds for large values. Overrides `page` and `per_page`.",
+      "Items per page (max 100, default 10). The tool internally paginates through the API to collect this many items. For example, per_page=100 fetches 10 internal API pages and returns 100 items. May take a few seconds for large values.",
     ),
 };
 
@@ -87,11 +78,10 @@ function tool<S extends z.ZodTypeAny>(def: TypedToolDef<S>): ToolDef {
   };
 }
 
-/** Build a query record by stripping undefined entries (also drops `limit`). */
+/** Build a query record by stripping undefined entries. */
 function q(input: Record<string, unknown>): Record<string, string | number | boolean | string[]> {
   const out: Record<string, string | number | boolean | string[]> = {};
   for (const [k, v] of Object.entries(input)) {
-    if (k === "limit") continue;
     if (v === undefined || v === null) continue;
     if (
       typeof v === "string" ||
@@ -113,44 +103,69 @@ interface CodListResponse<T> {
 }
 
 /**
- * Fetch up to `limit` items by internally paginating through the API
- * (which hard-caps at 10 items per page). If `limit` is not set, falls
- * back to a single-page request using the caller-supplied page/per_page.
+ * Fetch items with virtual pagination. The COD API hard-caps at 10 items per
+ * page, but callers can request up to 100 via `per_page`. This function
+ * internally fetches multiple API pages to fill the requested page size, and
+ * uses the caller's `page` to compute the correct offset.
+ *
+ * Example: per_page=100, page=2 → fetches API pages 11-20 (items 101-200).
  */
-async function fetchWithLimit<T>(
+async function fetchWithPagination<T>(
   client: CodClient,
   path: string,
   input: Record<string, unknown>,
 ): Promise<unknown> {
-  const limit = typeof input.limit === "number" ? input.limit : undefined;
+  const requestedPerPage = typeof input.per_page === "number" ? input.per_page : 10;
+  const requestedPage = typeof input.page === "number" ? input.page : 1;
 
-  if (!limit) {
-    // Single-page mode: pass through as-is.
+  if (requestedPerPage <= API_PAGE_SIZE) {
+    // No internal pagination needed — pass through directly.
     return client.request({ path, query: q(input) });
   }
 
+  // Strip page/per_page from query — we manage them internally.
   const query = q(input);
-  const items: T[] = [];
-  let page = 1;
-  const maxPages = Math.ceil(limit / API_PAGE_SIZE);
+  delete query.page;
+  delete query.per_page;
 
-  while (page <= maxPages) {
+  const internalPagesNeeded = Math.ceil(requestedPerPage / API_PAGE_SIZE);
+  const startApiPage = (requestedPage - 1) * internalPagesNeeded + 1;
+
+  const items: T[] = [];
+  let totalItems: number | undefined;
+  let totalApiPages: number | undefined;
+
+  for (let i = 0; i < internalPagesNeeded; i++) {
+    const apiPage = startApiPage + i;
+    if (totalApiPages !== undefined && apiPage > totalApiPages) break;
+
     const resp = await client.request<CodListResponse<T>>({
       path,
-      query: { ...query, page, per_page: API_PAGE_SIZE },
+      query: { ...query, page: apiPage, per_page: API_PAGE_SIZE },
     });
     const batch = resp.data ?? [];
     if (batch.length === 0) break;
     items.push(...batch);
-    if (items.length >= limit) break;
+
     const meta = resp.meta?.pagination;
-    if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
-    page += 1;
+    if (meta?.total !== undefined) totalItems = meta.total;
+    if (meta?.total_pages !== undefined) totalApiPages = meta.total_pages;
   }
 
+  const virtualTotalPages = totalApiPages !== undefined
+    ? Math.ceil(totalApiPages / internalPagesNeeded)
+    : undefined;
+
   return {
-    data: items.slice(0, limit),
-    meta: { total_fetched: Math.min(items.length, limit), pages_scanned: page },
+    data: items.slice(0, requestedPerPage),
+    meta: {
+      pagination: {
+        total: totalItems,
+        current_page: requestedPage,
+        per_page: requestedPerPage,
+        total_pages: virtualTotalPages,
+      },
+    },
   };
 }
 
@@ -161,10 +176,10 @@ async function fetchWithLimit<T>(
 const listProducts = tool({
   name: "cod_list_products",
   description:
-    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Set `limit` (up to 100) to auto-paginate and return more than 10 items at once. The API ignores `name=` / `q=` filters server-side — for name/SKU substring search use `cod_search_products` instead.",
+    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Use `per_page` (up to 100) to get more items per page. The API ignores `name=` / `q=` filters server-side — for name/SKU substring search use `cod_search_products` instead.",
   inputSchema: z.object({ ...Pagination, ...Sort }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/products", input),
+    fetchWithPagination(client, "/seller/products", input),
 });
 
 const getProduct = tool({
@@ -180,7 +195,7 @@ const getProduct = tool({
 const listDropProducts = tool({
   name: "cod_list_drop_products",
   description:
-    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). Set `limit` (up to 100) to auto-paginate. The `name=` and `sku=` filters are EXACT-match server-side — for substring search use `cod_search_products` with `kind: 'drop_products'`.",
+    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). Use `per_page` (up to 100) to get more items per page. The `name=` and `sku=` filters are EXACT-match server-side — for substring search use `cod_search_products` with `kind: 'drop_products'`.",
   inputSchema: z.object({
     name: z.string().optional().describe("Filter by exact drop product name (case-sensitive)."),
     sku: z.string().optional().describe("Filter by exact SKU."),
@@ -188,7 +203,7 @@ const listDropProducts = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/drop-products", input),
+    fetchWithPagination(client, "/seller/drop-products", input),
 });
 
 const getDropProduct = tool({
@@ -205,7 +220,7 @@ const getDropProduct = tool({
 
 const listStocks = tool({
   name: "cod_list_stocks",
-  description: "List stock levels per product per warehouse / country. Set `limit` (up to 100) to auto-paginate.",
+  description: "List stock levels per product per warehouse / country. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     product_id: z.union([z.string(), z.number()]).optional(),
     sku: z.string().optional(),
@@ -215,7 +230,7 @@ const listStocks = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/stocks", input),
+    fetchWithPagination(client, "/seller/stocks", input),
 });
 
 /* -------------------------------------------------------------------------- */
@@ -225,7 +240,7 @@ const listStocks = tool({
 const listOrders = tool({
   name: "cod_list_orders",
   description:
-    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Set `limit` (up to 100) to auto-paginate and return many orders at once (may take a few seconds). Without `limit`, returns one page of 10.",
+    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Use `per_page` (up to 100) to get more items per page (may take a few seconds). Use `page` to paginate through all results.",
   inputSchema: z.object({
     status: z
       .string()
@@ -243,7 +258,7 @@ const listOrders = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/orders", input),
+    fetchWithPagination(client, "/seller/orders", input),
 });
 
 const getOrder = tool({
@@ -263,7 +278,7 @@ const getOrder = tool({
 const listLeads = tool({
   name: "cod_list_leads",
   description:
-    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Set `limit` (up to 100) to auto-paginate and return many leads at once (may take a few seconds).",
+    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     status: z
       .string()
@@ -275,7 +290,7 @@ const listLeads = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/leads", input),
+    fetchWithPagination(client, "/seller/leads", input),
 });
 
 const getLead = tool({
@@ -299,16 +314,16 @@ const getLead = tool({
 const listStores = tool({
   name: "cod_list_stores",
   description:
-    "List the seller's connected stores (e.g. Shopify, WooCommerce, YouCan integrations). Set `limit` (up to 100) to auto-paginate.",
+    "List the seller's connected stores (e.g. Shopify, WooCommerce, YouCan integrations). Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({ ...Pagination, ...Sort }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/stores", input),
+    fetchWithPagination(client, "/seller/stores", input),
 });
 
 const listInvoices = tool({
   name: "cod_list_invoices",
   description:
-    "List the seller's invoices (remittance / payouts), newest first. Set `limit` (up to 100) to auto-paginate.",
+    "List the seller's invoices (remittance / payouts), newest first. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     status: z
       .string()
@@ -318,7 +333,7 @@ const listInvoices = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/invoices", input),
+    fetchWithPagination(client, "/seller/invoices", input),
 });
 
 const getInvoice = tool({
@@ -333,14 +348,14 @@ const getInvoice = tool({
 
 const listSourceRequests = tool({
   name: "cod_list_source_requests",
-  description: "List sourcing requests submitted to COD Network. Set `limit` (up to 100) to auto-paginate.",
+  description: "List sourcing requests submitted to COD Network. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     status: z.string().optional(),
     ...Pagination,
     ...Sort,
   }),
   handler: (input, client) =>
-    fetchWithLimit(client, "/seller/source-requests", input),
+    fetchWithPagination(client, "/seller/source-requests", input),
 });
 
 /* -------------------------------------------------------------------------- */

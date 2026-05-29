@@ -39,9 +39,10 @@ an LLM can answer questions like:
 
 ### Aggregation tools
 
-The COD API hard-caps responses at 10 items per page. All list tools accept a
-`limit` parameter (up to 100) that auto-paginates internally, fetching multiple
-pages behind the scenes so the LLM gets up to 100 items in a single tool call.
+The COD API hard-caps responses at 10 items per page. All list tools support
+`per_page` up to 100 — the tool internally paginates through multiple API pages
+to fill each virtual page. For example, `per_page: 100, page: 1` fetches 100
+items, then `page: 2` fetches the next 100, etc.
 The aggregation tools handle date-range pagination and filtering server-side:
 
 - **`cod_summarize_period({ since, until?, bucket?, group_by_product?, product_query?, include_examples? })`** — returns a compact JSON with totals, **total quantity, average quantity per order**, by-status, by-country, revenue per currency, confirmation/delivery rates. Set `bucket: "day" | "week" | "month"` to also get a `series` array (e.g. one row per day for a 30-day spreadsheet). Set `group_by_product: true` to add `by_product` breakdowns. Set `product_query` to limit the whole summary to rows touching a specific product.
