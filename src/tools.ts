@@ -18,13 +18,18 @@ import type { CodClient } from "./client.js";
 const Pagination = {
   page: z.number().int().min(1).optional().describe("Page number (1-based)."),
   per_page: z
-    .number()
-    .int()
-    .min(1)
-    .max(500)
+    .union([
+      z.literal(10),
+      z.literal(30),
+      z.literal(60),
+      z.literal(100),
+      z.literal(200),
+      z.literal(300),
+      z.literal(500),
+    ])
     .optional()
     .describe(
-      "Items per page (max 500). Defaults to 10 if omitted.",
+      "Items per page. Allowed values: 10, 30, 60, 100, 200, 300, 500. Defaults to 10 if omitted.",
     ),
 };
 
