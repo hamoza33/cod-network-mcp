@@ -16,15 +16,24 @@ import type { CodClient } from "./client.js";
 /* -------------------------------------------------------------------------- */
 
 const Pagination = {
-  page: z.number().int().min(1).optional().describe("Page number (1-based)."),
+  page: z.number().int().min(1).optional().describe("Page number (1-based). Each page returns `per_page` items."),
   per_page: z
     .number()
     .int()
     .min(1)
-    .max(10)
+    .max(100)
     .optional()
     .describe(
-      "Items per page. The API silently caps this at 10 even if a higher value is requested, so iterate with `page` to fetch more than 10 results.",
+      "Items per page (max 100, default 10). The tool internally paginates through the API to collect this many items. For example, per_page=100 fetches 10 internal API pages and returns 100 items. May take a few seconds for large values.",
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe(
+      "Alias for `per_page`. If both are provided, `per_page` takes priority.",
     ),
 };
 
@@ -95,6 +104,91 @@ function q(input: Record<string, unknown>): Record<string, string | number | boo
   return out;
 }
 
+const API_PAGE_SIZE = 10;
+
+interface CodListResponse<T> {
+  data: T[];
+  meta?: { pagination?: { total?: number; current_page?: number; total_pages?: number } };
+}
+
+/**
+ * Fetch items with virtual pagination. The COD API hard-caps at 10 items per
+ * page, but callers can request up to 100 via `per_page`. This function
+ * internally fetches multiple API pages to fill the requested page size, and
+ * uses the caller's `page` to compute the correct offset.
+ *
+ * Also accepts `limit` as a backward-compatible alias for `per_page`.
+ *
+ * Example: per_page=100, page=2 → fetches API pages 11-20 (items 101-200).
+ */
+async function fetchWithPagination<T>(
+  client: CodClient,
+  path: string,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  // Accept `limit` as backward-compat alias for `per_page`.
+  const rawPerPage = typeof input.per_page === "number"
+    ? input.per_page
+    : typeof input.limit === "number"
+      ? input.limit
+      : 10;
+  const requestedPerPage = Math.min(rawPerPage, 100);
+  const requestedPage = typeof input.page === "number" ? input.page : 1;
+
+  if (requestedPerPage <= API_PAGE_SIZE) {
+    // No internal pagination needed — pass through directly (strip limit).
+    const passQuery = q(input);
+    delete passQuery.limit;
+    return client.request({ path, query: passQuery });
+  }
+
+  // Strip page/per_page/limit from query — we manage them internally.
+  const query = q(input);
+  delete query.page;
+  delete query.per_page;
+  delete query.limit;
+
+  const internalPagesNeeded = Math.ceil(requestedPerPage / API_PAGE_SIZE);
+  const startApiPage = (requestedPage - 1) * internalPagesNeeded + 1;
+
+  const items: T[] = [];
+  let totalItems: number | undefined;
+  let totalApiPages: number | undefined;
+
+  for (let i = 0; i < internalPagesNeeded; i++) {
+    const apiPage = startApiPage + i;
+    if (totalApiPages !== undefined && apiPage > totalApiPages) break;
+
+    const resp = await client.request<CodListResponse<T>>({
+      path,
+      query: { ...query, page: apiPage, per_page: API_PAGE_SIZE },
+    });
+    const batch = resp.data ?? [];
+    if (batch.length === 0) break;
+    items.push(...batch);
+
+    const meta = resp.meta?.pagination;
+    if (meta?.total !== undefined) totalItems = meta.total;
+    if (meta?.total_pages !== undefined) totalApiPages = meta.total_pages;
+  }
+
+  const virtualTotalPages = totalApiPages !== undefined
+    ? Math.ceil(totalApiPages / internalPagesNeeded)
+    : undefined;
+
+  return {
+    data: items.slice(0, requestedPerPage),
+    meta: {
+      pagination: {
+        total: totalItems,
+        current_page: requestedPage,
+        per_page: requestedPerPage,
+        total_pages: virtualTotalPages,
+      },
+    },
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Catalog: products, drop products, marketplace, stocks                     */
 /* -------------------------------------------------------------------------- */
@@ -102,10 +196,10 @@ function q(input: Record<string, unknown>): Record<string, string | number | boo
 const listProducts = tool({
   name: "cod_list_products",
   description:
-    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Supports pagination and sorting only — the API ignores `name=` / `q=` filters server-side, so for name/SKU substring search use `cod_search_products` instead.",
+    "List the seller's products (catalog of items the seller manages, with stock per warehouse). Use `per_page` (up to 100) to get more items per page. The API ignores `name=` / `q=` filters server-side — for name/SKU substring search use `cod_search_products` instead.",
   inputSchema: z.object({ ...Pagination, ...Sort }),
   handler: (input, client) =>
-    client.request({ path: "/seller/products", query: q(input) }),
+    fetchWithPagination(client, "/seller/products", input),
 });
 
 const getProduct = tool({
@@ -121,7 +215,7 @@ const getProduct = tool({
 const listDropProducts = tool({
   name: "cod_list_drop_products",
   description:
-    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). The `name=` and `sku=` filters are EXACT-match server-side — for substring search use `cod_search_products` with `kind: 'drop_products'`.",
+    "List the seller's drop products (dropshipping catalog with up-sell pricing, media and landing pages). Use `per_page` (up to 100) to get more items per page. The `name=` and `sku=` filters are EXACT-match server-side — for substring search use `cod_search_products` with `kind: 'drop_products'`.",
   inputSchema: z.object({
     name: z.string().optional().describe("Filter by exact drop product name (case-sensitive)."),
     sku: z.string().optional().describe("Filter by exact SKU."),
@@ -129,7 +223,7 @@ const listDropProducts = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    client.request({ path: "/seller/drop-products", query: q(input) }),
+    fetchWithPagination(client, "/seller/drop-products", input),
 });
 
 const getDropProduct = tool({
@@ -146,7 +240,7 @@ const getDropProduct = tool({
 
 const listStocks = tool({
   name: "cod_list_stocks",
-  description: "List stock levels per product per warehouse / country.",
+  description: "List stock levels per product per warehouse / country. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     product_id: z.union([z.string(), z.number()]).optional(),
     sku: z.string().optional(),
@@ -156,17 +250,68 @@ const listStocks = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    client.request({ path: "/seller/stocks", query: q(input) }),
+    fetchWithPagination(client, "/seller/stocks", input),
 });
 
 /* -------------------------------------------------------------------------- */
 /*  Orders & leads                                                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Strip an order down to essential fields for compact mode.
+ * Keeps: id, reference, status, customer info, totals, dates, tracking, items
+ * summary. Drops: large HTML descriptions, nested product blobs, media, etc.
+ */
+function compactOrder(order: Record<string, unknown>): Record<string, unknown> {
+  const items = order.items as { data?: Record<string, unknown>[] } | undefined;
+  const compactItems = items?.data?.map((item: Record<string, unknown>) => {
+    const product = item.product as { data?: Record<string, unknown> } | undefined;
+    return {
+      quantity: item.quantity,
+      price: item.price,
+      product_id: product?.data?.id,
+      product_name: product?.data?.name,
+      product_sku: product?.data?.sku,
+    };
+  });
+
+  const customer = order.customer as { data?: Record<string, unknown> } | undefined;
+  const compactCustomer = customer?.data
+    ? {
+        name: customer.data.name,
+        phone: customer.data.phone,
+        city: customer.data.city,
+        country: customer.data.country_name ?? customer.data.country,
+      }
+    : undefined;
+
+  return {
+    id: order.id,
+    reference: order.reference,
+    status: order.status,
+    customer_name: order.customer_name ?? compactCustomer?.name,
+    customer_phone: order.customer_phone ?? compactCustomer?.phone,
+    customer_city: order.customer_city ?? compactCustomer?.city,
+    customer_country: order.customer_country_name ?? compactCustomer?.country,
+    total: order.total,
+    total_usd: order.total_usd,
+    currency: order.currency,
+    tracking_number: order.tracking_number,
+    tracking_status: order.tracking_status,
+    tracking_url: order.tracking_url,
+    shipped_at: order.shipped_at,
+    delivered_at: order.delivered_at,
+    returned_at: order.returned_at,
+    created_at: order.created_at,
+    ...(compactItems ? { items: compactItems } : {}),
+    ...(compactCustomer && !order.customer_name ? { customer: compactCustomer } : {}),
+  };
+}
+
 const listOrders = tool({
   name: "cod_list_orders",
   description:
-    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. To answer date-bounded questions (e.g. 'orders last week'), page through results until the `created_at` field is older than the desired range and aggregate client-side: the API ignores arbitrary date filters and caps `per_page` at 10.",
+    "List the seller's orders, newest first. Each order includes customer info, status, shipping and delivery dates. Use `per_page` (up to 100) to get more items per page (may take a few seconds). Use `page` to paginate through all results. Set `compact: true` (recommended for large fetches) to strip heavy fields like product descriptions and keep only essential order data — this dramatically reduces response size.",
   inputSchema: z.object({
     status: z
       .string()
@@ -179,12 +324,26 @@ const listOrders = tool({
       .string()
       .optional()
       .describe("Filter by customer phone number (best-effort match)."),
+    compact: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        "When true (default), strips large nested objects (product descriptions, HTML, media) and returns only essential fields per order. Set to false for full API response.",
+      ),
     ...Includes,
     ...Pagination,
     ...Sort,
   }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/orders", query: q(input) }),
+  handler: async (input, client) => {
+    const compact = input.compact !== false;
+    const { compact: _compact, ...rest } = input;
+    const result = await fetchWithPagination(client, "/seller/orders", rest) as Record<string, unknown>;
+    if (!compact) return result;
+    const data = result.data as Record<string, unknown>[] | undefined;
+    if (!data) return result;
+    return { ...result, data: data.map(compactOrder) };
+  },
 });
 
 const getOrder = tool({
@@ -204,19 +363,33 @@ const getOrder = tool({
 const listLeads = tool({
   name: "cod_list_leads",
   description:
-    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Same pagination caveats as `cod_list_orders`: page through results to handle date ranges client-side; `per_page` is capped at 10.",
+    "List leads (incoming orders before confirmation), newest first. Includes customer details, status and source. Use `per_page` (up to 100) to get more items per page. Set `compact: true` (recommended) to reduce response size.",
   inputSchema: z.object({
     status: z
       .string()
       .optional()
       .describe("Filter by lead status (e.g. `new`, `confirmed`, `cancelled`)."),
     customer_phone: z.string().optional(),
+    compact: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        "When true (default), strips large nested objects and returns only essential fields.",
+      ),
     ...Includes,
     ...Pagination,
     ...Sort,
   }),
-  handler: (input, client) =>
-    client.request({ path: "/seller/leads", query: q(input) }),
+  handler: async (input, client) => {
+    const compact = input.compact !== false;
+    const { compact: _compact, ...rest } = input;
+    const result = await fetchWithPagination(client, "/seller/leads", rest) as Record<string, unknown>;
+    if (!compact) return result;
+    const data = result.data as Record<string, unknown>[] | undefined;
+    if (!data) return result;
+    return { ...result, data: data.map(compactOrder) };
+  },
 });
 
 const getLead = tool({
@@ -240,16 +413,16 @@ const getLead = tool({
 const listStores = tool({
   name: "cod_list_stores",
   description:
-    "List the seller's connected stores (e.g. Shopify, WooCommerce, YouCan integrations).",
+    "List the seller's connected stores (e.g. Shopify, WooCommerce, YouCan integrations). Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({ ...Pagination, ...Sort }),
   handler: (input, client) =>
-    client.request({ path: "/seller/stores", query: q(input) }),
+    fetchWithPagination(client, "/seller/stores", input),
 });
 
 const listInvoices = tool({
   name: "cod_list_invoices",
   description:
-    "List the seller's invoices (remittance / payouts), newest first. Page through results to filter by date client-side; `per_page` is capped at 10.",
+    "List the seller's invoices (remittance / payouts), newest first. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     status: z
       .string()
@@ -259,7 +432,7 @@ const listInvoices = tool({
     ...Sort,
   }),
   handler: (input, client) =>
-    client.request({ path: "/seller/invoices", query: q(input) }),
+    fetchWithPagination(client, "/seller/invoices", input),
 });
 
 const getInvoice = tool({
@@ -274,14 +447,14 @@ const getInvoice = tool({
 
 const listSourceRequests = tool({
   name: "cod_list_source_requests",
-  description: "List sourcing requests submitted to COD Network.",
+  description: "List sourcing requests submitted to COD Network. Use `per_page` (up to 100) to get more items per page.",
   inputSchema: z.object({
     status: z.string().optional(),
     ...Pagination,
     ...Sort,
   }),
   handler: (input, client) =>
-    client.request({ path: "/seller/source-requests", query: q(input) }),
+    fetchWithPagination(client, "/seller/source-requests", input),
 });
 
 /* -------------------------------------------------------------------------- */
@@ -299,7 +472,8 @@ const SUMMARY_MAX_PAGES = 200;
 /**
  * Number of pages fetched concurrently inside `paginateInRange`. Higher values
  * reduce wall-clock time dramatically when the date range spans many pages
- * (COD caps per_page at 10 so even moderate ranges need dozens of pages).
+ * The API hard-caps at 10 per page, so concurrent fetching is important
+ * for large date ranges.
  */
 const PAGE_CONCURRENCY = 5;
 
@@ -343,11 +517,6 @@ interface CodProduct {
   name?: string;
   name_arabic?: string;
   sku?: string;
-}
-
-interface CodListResponse<T> {
-  data: T[];
-  meta?: { pagination?: { total?: number; current_page?: number; total_pages?: number } };
 }
 
 /**
@@ -401,7 +570,7 @@ async function paginateInRange<T extends { created_at?: string }>(
       pageNums.map((p) =>
         client.request<CodListResponse<T>>({
           path,
-          query: { ...query, page: p, per_page: 10, sort: "-created_at" },
+          query: { ...query, page: p, per_page: API_PAGE_SIZE, sort: "-created_at" },
         }),
       ),
     );
@@ -832,7 +1001,7 @@ const searchProducts = tool({
       for (let page = 1; page <= maxPages && matches.length < limit; page += 1) {
         const resp = await client.request<CodListResponse<CodProduct>>({
           path,
-          query: { page, per_page: 10 },
+          query: { page, per_page: API_PAGE_SIZE },
         });
         pagesScanned = page;
         const batch = resp.data ?? [];
@@ -904,7 +1073,7 @@ const getProductBySku = tool({
       for (let page = 1; page <= maxPages; page += 1) {
         const resp = await client.request<CodListResponse<CodProduct>>({
           path,
-          query: { page, per_page: 10 },
+          query: { page, per_page: API_PAGE_SIZE },
         });
         const batch = resp.data ?? [];
         if (batch.length === 0) break;
@@ -926,7 +1095,7 @@ const getProductBySku = tool({
       // Drop-products endpoint supports exact `sku=` filter server-side.
       const resp = await client.request<CodListResponse<CodProduct>>({
         path: "/seller/drop-products",
-        query: { sku: input.sku.trim(), page: 1, per_page: 10 },
+        query: { sku: input.sku.trim(), page: 1, per_page: API_PAGE_SIZE },
       });
       if (resp.data?.length) {
         return { product: resp.data[0], pages_scanned: 1, source: "drop_products" };

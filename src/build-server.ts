@@ -67,7 +67,10 @@ export function buildMcpServer(cfg: CodConfig): {
     tools: tools.map((t) => ({
       name: t.name,
       description: t.description,
-      inputSchema: zodToJsonSchema(t.inputSchema, { target: "openApi3" }),
+      inputSchema: zodToJsonSchema(t.inputSchema, {
+        target: "jsonSchema7",
+        $refStrategy: "none",
+      }),
     })),
   }));
 
