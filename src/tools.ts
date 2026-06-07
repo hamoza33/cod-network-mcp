@@ -2573,6 +2573,283 @@ const getConfirmedDashboard = tool({
 });
 
 /* -------------------------------------------------------------------------- */
+/*  v2.1 tools — lead input + lead reasons                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fetch a single lead and return ONLY the raw original_payload (lead input)
+ * plus the lead id, status, and created_at for reference.
+ */
+const getLeadInput = tool({
+  name: "cod_get_lead_input",
+  description:
+    "Return the raw lead-input data (the original form submission as entered by the customer) for a single lead. " +
+    "Returns only the parsed original_payload fields: first_name, last_name, email, phone, address, country, city, " +
+    "currency, total_price, total_quantity, and per-item sku/product_name/quantity/price.",
+  inputSchema: z.object({
+    id: z.union([z.string(), z.number()]).describe("Lead id."),
+  }),
+  handler: async (input, client) => {
+    const resp = await client.request<{ data: Record<string, unknown> }>({
+      path: `/seller/leads/${encodeURIComponent(String(input.id))}`,
+    });
+    const lead = resp.data ?? {};
+    let payload: Record<string, unknown> = {};
+    try {
+      const raw = (lead.original_payload as string) ?? "{}";
+      payload = JSON.parse(raw);
+    } catch {
+      /* empty */
+    }
+    return {
+      lead_id: lead.id,
+      status: lead.status,
+      created_at: lead.created_at,
+      input: payload,
+    };
+  },
+});
+
+/**
+ * Bulk-extract only lead input data (original_payload) for leads filtered by
+ * product name, with date range support.
+ */
+const exportLeadInputs = tool({
+  name: "cod_export_lead_inputs",
+  description:
+    "Bulk-export the raw lead-input data (original form submissions) for leads matching a product name/SKU. " +
+    "Returns only the parsed original_payload fields per lead — the exact data as entered by the customer. " +
+    "Useful for extracting what customers typed into landing page forms.",
+  inputSchema: z.object({
+    product_name: z
+      .string()
+      .describe(
+        "Product name or SKU to filter by (case-insensitive substring match on the lead's products field).",
+      ),
+    since: z
+      .string()
+      .optional()
+      .describe("Start date (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End date (YYYY-MM-DD). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by lead status label (e.g. 'Confirmed', 'Cancelled', 'Wrong'). Omit for all."),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Skip this many matched leads (for chunked retrieval). Default 0."),
+    chunk_size: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Max leads to return. Default 500."),
+  }),
+  handler: async (input, client) => {
+    const since = input.since ? toUtcStamp(input.since) : defaultSince();
+    const until = input.until ? toUtcStamp(input.until) : toUtcStamp(new Date().toISOString());
+    const needle = input.product_name.toLowerCase();
+    const statusFilter = input.status?.toLowerCase();
+    const offset = input.offset ?? 0;
+    const chunkSize = input.chunk_size ?? 500;
+
+    const { items: all } = await paginateInRange<CodLead & { original_payload?: string }>(
+      client,
+      "/seller/leads",
+      since,
+      until,
+      {},
+    );
+
+    const matched = all.filter((l: CodLead & { original_payload?: string }) => {
+      const prods = (l.products ?? "").toLowerCase();
+      if (!prods.includes(needle)) return false;
+      if (statusFilter) {
+        const label = (l.status?.label ?? "").toLowerCase();
+        if (label !== statusFilter) return false;
+      }
+      return true;
+    });
+
+    const slice = matched.slice(offset, offset + chunkSize);
+
+    const rows = slice.map((l: CodLead & { original_payload?: string }) => {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(l.original_payload ?? "{}");
+      } catch {
+        /* empty */
+      }
+      return {
+        lead_id: l.id,
+        status: l.status?.label ?? "",
+        created_at: l.created_at ?? "",
+        ...payload,
+      };
+    });
+
+    return {
+      total_matched: matched.length,
+      returned: rows.length,
+      offset,
+      has_more: offset + chunkSize < matched.length,
+      next_offset: offset + chunkSize < matched.length ? offset + chunkSize : null,
+      leads: rows,
+    };
+  },
+});
+
+/**
+ * Fetch history (status transitions + comments/reasons) for one or more leads.
+ * The history shows why a lead was cancelled/marked wrong — each transition
+ * includes a status_from, status_to, comment (the reason), and timestamp.
+ */
+const getLeadReasons = tool({
+  name: "cod_get_lead_reasons",
+  description:
+    "Fetch the status-change history and cancellation/wrong reasons for one or more leads. " +
+    "Each history entry has: status_from, status_to, comment (the reason), created_at. " +
+    "Pass an array of lead IDs or a product name + date range to bulk-fetch reasons " +
+    "for all cancelled/wrong leads.",
+  inputSchema: z.object({
+    lead_ids: z
+      .array(z.number())
+      .optional()
+      .describe("Specific lead IDs to fetch reasons for. If provided, product_name/date filters are ignored."),
+    product_name: z
+      .string()
+      .optional()
+      .describe(
+        "Product name or SKU to filter by (case-insensitive substring match). " +
+        "Used with date range to find cancelled/wrong leads automatically.",
+      ),
+    since: z
+      .string()
+      .optional()
+      .describe("Start date (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End date (YYYY-MM-DD). Defaults to now."),
+    status_filter: z
+      .array(z.string())
+      .optional()
+      .describe(
+        "Only fetch reasons for leads with these statuses (e.g. ['Cancelled', 'Wrong']). " +
+        "Default: ['Cancelled', 'Wrong', 'No Reply'].",
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Max number of leads to fetch history for (API calls are 1 per lead). Default 50."),
+  }),
+  handler: async (input, client) => {
+    const limit = input.limit ?? 50;
+    let leadIds: number[] = [];
+
+    if (input.lead_ids && input.lead_ids.length > 0) {
+      leadIds = input.lead_ids.slice(0, limit);
+    } else {
+      // Discover leads matching product + date range, then filter by status
+      const since = input.since ? toUtcStamp(input.since) : defaultSince();
+      const until = input.until ? toUtcStamp(input.until) : toUtcStamp(new Date().toISOString());
+      const needle = input.product_name?.toLowerCase() ?? "";
+
+      const { items: all } = await paginateInRange<CodLead>(
+        client,
+        "/seller/leads",
+        since,
+        until,
+        {},
+      );
+
+      const statusFilter = (input.status_filter ?? ["Cancelled", "Wrong", "No Reply"]).map((s) =>
+        s.toLowerCase(),
+      );
+
+      const filtered = all.filter((l: CodLead) => {
+        if (needle && !(l.products ?? "").toLowerCase().includes(needle)) return false;
+        const label = (l.status?.label ?? "").toLowerCase();
+        return statusFilter.includes(label);
+      });
+
+      leadIds = filtered.slice(0, limit).map((l: CodLead) => l.id);
+    }
+
+    // Fetch history for each lead (batched concurrently in groups of 5)
+    interface HistoryEntry {
+      id: number;
+      status_from: string;
+      status_to: string;
+      comment: string;
+      created_at: string;
+    }
+    interface LeadDetailResp {
+      data: {
+        id: number;
+        phone?: string;
+        status?: { label?: string; code?: number };
+        products?: string;
+        comments?: string;
+        created_at?: string;
+        history?: { data: HistoryEntry[] };
+      };
+    }
+
+    const results: Array<{
+      lead_id: number;
+      phone?: string;
+      status?: string;
+      products?: string;
+      created_at?: string;
+      final_reason?: string;
+      history: HistoryEntry[];
+    }> = [];
+
+    const BATCH = 5;
+    for (let i = 0; i < leadIds.length; i += BATCH) {
+      const batch = leadIds.slice(i, i + BATCH);
+      const fetched = await Promise.all(
+        batch.map((id) =>
+          client.request<LeadDetailResp["data"]>({
+            path: `/seller/leads/${id}`,
+            query: { include: "history" },
+          }),
+        ),
+      );
+      for (const resp of fetched) {
+        const d = (resp as unknown as LeadDetailResp).data ?? (resp as unknown as LeadDetailResp["data"]);
+        const history = d.history?.data ?? [];
+        // The final reason is the comment on the last history entry
+        const finalEntry = history.length > 0 ? history[history.length - 1] : undefined;
+        results.push({
+          lead_id: d.id,
+          phone: d.phone,
+          status: d.status?.label,
+          products: d.products,
+          created_at: d.created_at,
+          final_reason: finalEntry?.comment ?? d.comments ?? "",
+          history,
+        });
+      }
+    }
+
+    return {
+      total_fetched: results.length,
+      leads: results,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
 
 export const tools: ReadonlyArray<ToolDef> = [
   // ── existing tools (untouched) ──
@@ -2610,4 +2887,8 @@ export const tools: ReadonlyArray<ToolDef> = [
   getStatistics,
   getDeliveredDashboard,
   getConfirmedDashboard,
+  // ── v2.1 tools ──
+  getLeadInput,
+  exportLeadInputs,
+  getLeadReasons,
 ];
