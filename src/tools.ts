@@ -1314,9 +1314,1268 @@ const rawRequest = tool({
     }),
 });
 
+/* ========================================================================== */
+/*  V2 TOOLS — added on top of existing ones. Nothing above is modified.      */
+/* ========================================================================== */
+
+/**
+ * Paginate ALL items from a list endpoint (no date filtering, just scan every page).
+ */
+async function paginateAll<T>(
+  client: CodClient,
+  path: string,
+  query: Record<string, string | number | boolean | string[]> = {},
+  maxPages = SUMMARY_MAX_PAGES,
+): Promise<T[]> {
+  const items: T[] = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const resp = await client.request<CodListResponse<T>>({
+      path,
+      query: { ...query, page, per_page: 10 },
+    });
+    const batch = resp.data ?? [];
+    if (batch.length === 0) break;
+    items.push(...batch);
+    const meta = resp.meta?.pagination;
+    if (meta?.total_pages !== undefined && page >= meta.total_pages) break;
+  }
+  return items;
+}
+
+/**
+ * Apply a field projection to an object, keeping only the specified keys.
+ */
+function projectFields<T extends Record<string, unknown>>(
+  row: T,
+  fields?: string[],
+): Partial<T> {
+  if (!fields || fields.length === 0) return row;
+  const out: Partial<T> = {};
+  for (const f of fields) {
+    if (f in row) {
+      (out as Record<string, unknown>)[f] = row[f as keyof T];
+    }
+  }
+  return out;
+}
+
+/**
+ * Normalise a date default: if the caller provides nothing, return a sensible
+ * fallback (1 year ago for `since`, now for `until`).
+ */
+function defaultSince(): string {
+  const d = new Date();
+  d.setUTCFullYear(d.getUTCFullYear() - 1);
+  return d.toISOString();
+}
+
+/* -------------------------------------------------------------------------- */
+/*  1. Discovery / context                                                    */
+/* -------------------------------------------------------------------------- */
+
+const discoverContext = tool({
+  name: "cod_discover_context",
+  description:
+    "Zero-input discovery tool. Returns the seller's full product catalog (own products + drop " +
+    "products), unique countries seen in recent orders, earliest/latest order timestamps, and " +
+    "active lead statuses. Call this once at the start of a workflow so you never need to " +
+    "guess product names, date ranges, or markets.",
+  inputSchema: z.object({
+    include_drop_products: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Also fetch the COD Drop catalog."),
+    orders_sample_pages: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .default(20)
+      .describe("How many order pages to sample for country/date metadata (10 per page)."),
+  }),
+  handler: async (input, client) => {
+    const [products, dropProducts, firstOrders, lastOrders] = await Promise.all([
+      paginateAll<CodProduct>(client, "/seller/products"),
+      input.include_drop_products
+        ? paginateAll<CodProduct>(client, "/seller/drop-products")
+        : Promise.resolve([]),
+      // Oldest orders (ascending)
+      client
+        .request<CodListResponse<CodOrder>>({
+          path: "/seller/orders",
+          query: { page: 1, per_page: 10, sort: "created_at" },
+        })
+        .then((r) => r.data ?? [])
+        .catch(() => [] as CodOrder[]),
+      // Newest orders (descending) — sample pages for country discovery
+      paginateInRange<CodOrder>(
+        client,
+        "/seller/orders",
+        "1970-01-01 00:00:00",
+        toUtcStamp(new Date().toISOString()),
+        { include: "items" },
+      ).then((r) => r.items.slice(0, (input.orders_sample_pages ?? 20) * 10)),
+    ]);
+
+    const countries = new Set<string>();
+    const cities = new Set<string>();
+    const currencies = new Set<string>();
+    const productNamesFromOrders = new Set<string>();
+    let earliest: string | undefined;
+    let latest: string | undefined;
+    for (const o of firstOrders) {
+      if (o.created_at && (!earliest || o.created_at < earliest)) earliest = o.created_at;
+    }
+    for (const o of lastOrders) {
+      if (o.customer_country_name) countries.add(o.customer_country_name);
+      if (o.customer_city) cities.add(o.customer_city);
+      if (o.currency) currencies.add(o.currency);
+      if (o.created_at && (!latest || o.created_at > latest)) latest = o.created_at;
+      if (o.created_at && (!earliest || o.created_at < earliest)) earliest = o.created_at;
+      for (const name of orderProductNames(o)) productNamesFromOrders.add(name);
+    }
+
+    return {
+      products: products.map((p) => ({ id: p.id, name: p.name, sku: p.sku, type: "product" })),
+      drop_products: dropProducts.map((p) => ({
+        id: p.id,
+        name: p.name,
+        sku: p.sku,
+        type: "drop_product",
+      })),
+      total_products: products.length,
+      total_drop_products: dropProducts.length,
+      active_countries: [...countries].sort(),
+      active_cities_sample: [...cities].sort().slice(0, 50),
+      active_currencies: [...currencies].sort(),
+      product_names_from_orders: [...productNamesFromOrders].sort(),
+      date_coverage: { earliest, latest },
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  2. Full product catalog                                                   */
+/* -------------------------------------------------------------------------- */
+
+const getProductCatalog = tool({
+  name: "cod_get_product_catalog",
+  description:
+    "Fetch the entire product catalog in one call. Paginates all pages server-side and " +
+    "returns a flat list of every product (and optionally drop-product) with id, name, and SKU.",
+  inputSchema: z.object({
+    include_drop_products: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Include the COD Drop catalog too."),
+  }),
+  handler: async (input, client) => {
+    const [products, dropProducts] = await Promise.all([
+      paginateAll<CodProduct>(client, "/seller/products"),
+      input.include_drop_products
+        ? paginateAll<CodProduct>(client, "/seller/drop-products")
+        : Promise.resolve([]),
+    ]);
+    return {
+      products: products.map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+      drop_products: dropProducts.map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+      total_products: products.length,
+      total_drop_products: dropProducts.length,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  3. Bulk parallel multi-product order fetch                                */
+/* -------------------------------------------------------------------------- */
+
+const OrderFields = z
+  .array(
+    z.enum([
+      "order_id",
+      "reference",
+      "status",
+      "customer_name",
+      "customer_city",
+      "customer_country",
+      "customer_phone",
+      "currency",
+      "total",
+      "total_usd",
+      "shipped_at",
+      "delivered_at",
+      "returned_at",
+      "tracking_number",
+      "tracking_status",
+      "tracking_url",
+      "created_at",
+      "items",
+    ]),
+  )
+  .optional()
+  .describe(
+    "Field projection: only return these fields per order. Omit to return all. " +
+    "Smaller payloads = faster transfer and no truncation.",
+  );
+
+interface FlatOrder {
+  order_id: number;
+  reference?: string;
+  status?: string;
+  customer_name?: string;
+  customer_city?: string;
+  customer_country?: string;
+  customer_phone?: string | null;
+  currency?: string;
+  total?: number;
+  total_usd?: number;
+  shipped_at?: string | null;
+  delivered_at?: string | null;
+  returned_at?: string | null;
+  tracking_number?: string | null;
+  tracking_status?: string | null;
+  tracking_url?: string | null;
+  created_at?: string;
+  items?: Array<{
+    product_name?: string;
+    sku?: string;
+    quantity?: number;
+    price?: number;
+  }>;
+  _product_match?: string;
+}
+
+function flattenOrder(o: CodOrder): FlatOrder {
+  return {
+    order_id: o.id,
+    reference: o.reference,
+    status: o.status?.label,
+    customer_name: o.customer_name,
+    customer_city: o.customer_city,
+    customer_country: o.customer_country_name,
+    customer_phone: o.customer_phone || null,
+    currency: o.currency,
+    total: o.total,
+    total_usd: o.total_usd,
+    shipped_at: o.shipped_at,
+    delivered_at: o.delivered_at,
+    returned_at: o.returned_at,
+    tracking_number: o.tracking_number || null,
+    tracking_status: o.tracking_status || null,
+    tracking_url: o.tracking_url && o.tracking_url !== "#" ? o.tracking_url : null,
+    created_at: o.created_at,
+    items: (o.items?.data ?? []).map((it) => ({
+      product_name: it.product?.data?.name,
+      sku: it.product?.data?.sku,
+      quantity: it.quantity,
+      price: it.price,
+    })),
+  };
+}
+
+const getOrdersBulk = tool({
+  name: "cod_get_orders_bulk",
+  description:
+    "Parallel multi-product order fetch. Pass multiple product names and the server fires " +
+    "all requests concurrently via Promise.all(), merges the results, and returns one response. " +
+    "Cuts a 3-product fetch from ~3x time to ~1x time. Use `fields` to project only the " +
+    "columns you need — smaller payloads avoid truncation.",
+  inputSchema: z.object({
+    product_names: z
+      .array(z.string())
+      .min(1)
+      .describe("Product names to fetch orders for (case-insensitive substring match)."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by order status (e.g. `delivered`, `shipped`)."),
+    fields: OrderFields,
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {
+      include: "items",
+    };
+    if (input.status) queryParams.status = input.status;
+
+    // Fetch all orders once (shared across all product filters)
+    const { items: allOrders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, queryParams);
+
+    // Filter per product in parallel (CPU-bound, no I/O)
+    const perProduct: Array<{
+      product: string;
+      orders: Array<Partial<FlatOrder>>;
+      count: number;
+      delivered: number;
+      returned: number;
+    }> = [];
+
+    for (const pName of input.product_names) {
+      const needle = pName.trim().toLowerCase();
+      const matched = allOrders.filter((o) =>
+        orderProductNames(o).some((n) => n.toLowerCase().includes(needle)),
+      );
+      const flat = matched.map((o) => {
+        const fo = flattenOrder(o);
+        fo._product_match = pName;
+        return projectFields(fo as unknown as Record<string, unknown>, input.fields) as Partial<FlatOrder>;
+      });
+      perProduct.push({
+        product: pName,
+        orders: flat,
+        count: matched.length,
+        delivered: matched.filter((o) => o.delivered_at).length,
+        returned: matched.filter((o) => o.returned_at).length,
+      });
+    }
+
+    return {
+      range: { since, until },
+      products_requested: input.product_names,
+      fields: input.fields ?? "all",
+      per_product: perProduct.map(({ product, count, delivered, returned }) => ({
+        product,
+        total_orders: count,
+        delivered,
+        returned,
+      })),
+      all_orders: perProduct.flatMap((p) => p.orders),
+      total_orders: perProduct.reduce((s, p) => s + p.count, 0),
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  4. Server-side aggregation: by city                                       */
+/* -------------------------------------------------------------------------- */
+
+const aggregateByCity = tool({
+  name: "cod_aggregate_by_city",
+  description:
+    "Server-side aggregation of orders grouped by customer_city. Returns pre-aggregated " +
+    "rows — no raw order dump needed, no bash processing. Supports optional product filter. " +
+    "Use `metrics` to choose which counts are included.",
+  inputSchema: z.object({
+    product_names: z
+      .array(z.string())
+      .optional()
+      .describe("Filter to orders matching these products (case-insensitive substring)."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    group_by: z
+      .enum(["customer_city", "customer_country"])
+      .optional()
+      .default("customer_city")
+      .describe("Group rows by city or country."),
+    metrics: z
+      .array(z.enum(["total", "delivered", "returned", "pending", "shipped", "revenue_usd"]))
+      .optional()
+      .default(["total", "delivered", "returned", "pending"])
+      .describe("Which aggregate metrics to include per group."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(500)
+      .optional()
+      .default(100)
+      .describe("Max groups to return, sorted by total descending."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const { items: allOrders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, { include: "items" });
+
+    let orders = allOrders;
+    if (input.product_names?.length) {
+      const needles = input.product_names.map((n) => n.trim().toLowerCase());
+      orders = orders.filter((o) =>
+        orderProductNames(o).some((name) =>
+          needles.some((needle) => name.toLowerCase().includes(needle)),
+        ),
+      );
+    }
+
+    const groupKey = input.group_by ?? "customer_city";
+    const groups = new Map<
+      string,
+      { total: number; delivered: number; returned: number; pending: number; shipped: number; revenue_usd: number }
+    >();
+
+    for (const o of orders) {
+      const key =
+        groupKey === "customer_city"
+          ? o.customer_city ?? "(unknown)"
+          : o.customer_country_name ?? "(unknown)";
+      const g = groups.get(key) ?? {
+        total: 0,
+        delivered: 0,
+        returned: 0,
+        pending: 0,
+        shipped: 0,
+        revenue_usd: 0,
+      };
+      g.total += 1;
+      if (o.delivered_at) g.delivered += 1;
+      if (o.returned_at) g.returned += 1;
+      const statusLabel = (o.status?.label ?? "").toLowerCase();
+      if (statusLabel === "pending") g.pending += 1;
+      if (statusLabel === "shipped" || o.shipped_at) g.shipped += 1;
+      g.revenue_usd += o.total_usd ?? 0;
+      groups.set(key, g);
+    }
+
+    const wantMetrics = new Set(input.metrics ?? ["total", "delivered", "returned", "pending"]);
+    const limit = input.limit ?? 100;
+
+    const rows = [...groups.entries()]
+      .sort((a, b) => b[1].total - a[1].total)
+      .slice(0, limit)
+      .map(([key, g]) => {
+        const row: Record<string, unknown> = { [groupKey]: key };
+        if (wantMetrics.has("total")) row.total = g.total;
+        if (wantMetrics.has("delivered")) row.delivered = g.delivered;
+        if (wantMetrics.has("returned")) row.returned = g.returned;
+        if (wantMetrics.has("pending")) row.pending = g.pending;
+        if (wantMetrics.has("shipped")) row.shipped = g.shipped;
+        if (wantMetrics.has("revenue_usd")) row.revenue_usd = round(g.revenue_usd);
+        return row;
+      });
+
+    return {
+      range: { since, until },
+      group_by: groupKey,
+      product_filter: input.product_names ?? null,
+      total_orders_scanned: orders.length,
+      groups_returned: rows.length,
+      rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  5. Generic order aggregation                                              */
+/* -------------------------------------------------------------------------- */
+
+const aggregateOrdersGeneric = tool({
+  name: "cod_aggregate_orders",
+  description:
+    "Flexible server-side order aggregation. Group orders by city, country, product, " +
+    "status, or time bucket (day/week/month). Returns pre-aggregated rows with counts " +
+    "and revenue — no raw order dump or client-side processing needed.",
+  inputSchema: z.object({
+    group_by: z
+      .enum(["customer_city", "customer_country", "product", "status", "day", "week", "month"])
+      .describe("Dimension to aggregate on."),
+    product_names: z
+      .array(z.string())
+      .optional()
+      .describe("Filter to orders matching these products (case-insensitive substring)."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by order status before aggregating."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(1000)
+      .optional()
+      .default(200)
+      .describe("Max groups to return."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {
+      include: "items",
+    };
+    if (input.status) queryParams.status = input.status;
+
+    const { items: allOrders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, queryParams);
+
+    let orders = allOrders;
+    if (input.product_names?.length) {
+      const needles = input.product_names.map((n) => n.trim().toLowerCase());
+      orders = orders.filter((o) =>
+        orderProductNames(o).some((name) =>
+          needles.some((needle) => name.toLowerCase().includes(needle)),
+        ),
+      );
+    }
+
+    const gb = input.group_by;
+    const groups = new Map<
+      string,
+      {
+        total: number;
+        delivered: number;
+        returned: number;
+        total_qty: number;
+        revenue_usd: number;
+        revenue_by_currency: Record<string, number>;
+      }
+    >();
+
+    const keyFn = (o: CodOrder): string[] => {
+      switch (gb) {
+        case "customer_city":
+          return [o.customer_city ?? "(unknown)"];
+        case "customer_country":
+          return [o.customer_country_name ?? "(unknown)"];
+        case "product":
+          return orderProductNames(o).length > 0 ? orderProductNames(o) : ["(unknown)"];
+        case "status":
+          return [o.status?.label ?? "(unknown)"];
+        case "day":
+        case "week":
+        case "month":
+          return [o.created_at ? bucketKey(o.created_at, gb) : "(unknown)"];
+        default:
+          return ["(unknown)"];
+      }
+    };
+
+    for (const o of orders) {
+      for (const key of keyFn(o)) {
+        const g = groups.get(key) ?? {
+          total: 0,
+          delivered: 0,
+          returned: 0,
+          total_qty: 0,
+          revenue_usd: 0,
+          revenue_by_currency: {},
+        };
+        g.total += 1;
+        if (o.delivered_at) g.delivered += 1;
+        if (o.returned_at) g.returned += 1;
+        g.total_qty += orderItemQty(o);
+        g.revenue_usd += o.total_usd ?? 0;
+        const cur = o.currency ?? "(unknown)";
+        g.revenue_by_currency[cur] = (g.revenue_by_currency[cur] ?? 0) + (o.total ?? 0);
+        groups.set(key, g);
+      }
+    }
+
+    const limit = input.limit ?? 200;
+    const isTimeBucket = gb === "day" || gb === "week" || gb === "month";
+    const sorted = [...groups.entries()].sort((a, b) =>
+      isTimeBucket ? a[0].localeCompare(b[0]) : b[1].total - a[1].total,
+    );
+
+    const rows = sorted.slice(0, limit).map(([key, g]) => ({
+      [gb]: key,
+      total: g.total,
+      delivered: g.delivered,
+      returned: g.returned,
+      delivery_rate_pct: g.total > 0 ? round((g.delivered / g.total) * 100, 1) : 0,
+      total_qty: g.total_qty,
+      revenue_usd: round(g.revenue_usd),
+      revenue_by_currency: Object.fromEntries(
+        Object.entries(g.revenue_by_currency).map(([k, v]) => [k, round(v)]),
+      ),
+    }));
+
+    return {
+      range: { since, until },
+      group_by: gb,
+      product_filter: input.product_names ?? null,
+      total_orders_scanned: orders.length,
+      groups_returned: rows.length,
+      rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  6. Generic lead aggregation                                               */
+/* -------------------------------------------------------------------------- */
+
+const aggregateLeadsGeneric = tool({
+  name: "cod_aggregate_leads",
+  description:
+    "Flexible server-side lead aggregation. Group leads by product, status, or time " +
+    "bucket (day/week/month). Returns pre-aggregated rows with counts and confirmation " +
+    "rates. Supports product filtering so you can get per-product lead stats in one call.",
+  inputSchema: z.object({
+    group_by: z
+      .enum(["product", "status", "day", "week", "month"])
+      .describe("Dimension to aggregate on."),
+    product_names: z
+      .array(z.string())
+      .optional()
+      .describe("Filter to leads matching these products (case-insensitive substring on the products field)."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by lead status before aggregating."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(1000)
+      .optional()
+      .default(200)
+      .describe("Max groups to return."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {};
+    if (input.status) queryParams.status = input.status;
+
+    const { items: allLeads, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodLead>(client, "/seller/leads", since, until, queryParams);
+
+    let leads = allLeads;
+    if (input.product_names?.length) {
+      const needles = input.product_names.map((n) => n.trim().toLowerCase());
+      leads = leads.filter((l) =>
+        leadProductNames(l).some((name) =>
+          needles.some((needle) => name.toLowerCase().includes(needle)),
+        ),
+      );
+    }
+
+    const gb = input.group_by;
+    const groups = new Map<string, { total: number; confirmed: number }>();
+
+    const keyFn = (l: CodLead): string[] => {
+      switch (gb) {
+        case "product":
+          return leadProductNames(l).length > 0 ? leadProductNames(l) : ["(unknown)"];
+        case "status":
+          return [l.status?.label ?? "(unknown)"];
+        case "day":
+        case "week":
+        case "month":
+          return [l.created_at ? bucketKey(l.created_at, gb) : "(unknown)"];
+        default:
+          return ["(unknown)"];
+      }
+    };
+
+    for (const l of leads) {
+      const isConfirmed = (l.status?.label ?? "").toLowerCase() === "confirmed";
+      for (const key of keyFn(l)) {
+        const g = groups.get(key) ?? { total: 0, confirmed: 0 };
+        g.total += 1;
+        if (isConfirmed) g.confirmed += 1;
+        groups.set(key, g);
+      }
+    }
+
+    const limit = input.limit ?? 200;
+    const isTimeBucket = gb === "day" || gb === "week" || gb === "month";
+    const sorted = [...groups.entries()].sort((a, b) =>
+      isTimeBucket ? a[0].localeCompare(b[0]) : b[1].total - a[1].total,
+    );
+
+    const rows = sorted.slice(0, limit).map(([key, g]) => ({
+      [gb]: key,
+      total: g.total,
+      confirmed: g.confirmed,
+      confirmation_rate_pct: g.total > 0 ? round((g.confirmed / g.total) * 100, 1) : 0,
+    }));
+
+    return {
+      range: { since, until },
+      group_by: gb,
+      product_filter: input.product_names ?? null,
+      total_leads_scanned: leads.length,
+      groups_returned: rows.length,
+      rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  7. Leads filtered by product                                              */
+/* -------------------------------------------------------------------------- */
+
+const getLeadsByProduct = tool({
+  name: "cod_get_leads_by_product",
+  description:
+    "Fetch leads filtered by product name or SKU. The COD API does not support product " +
+    "filtering on leads server-side, so this tool paginates all leads and filters locally. " +
+    "Returns raw lead data for the matched product — useful for getting lead-input data " +
+    "for a specific SKU.",
+  inputSchema: z.object({
+    product_name: z
+      .string()
+      .optional()
+      .describe("Case-insensitive substring match against the lead's products field."),
+    product_sku: z
+      .string()
+      .optional()
+      .describe("Case-insensitive substring match against SKU in the lead's products field."),
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by lead status (e.g. `confirmed`, `cancelled`)."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(5000)
+      .optional()
+      .default(500)
+      .describe("Max leads to return."),
+  }),
+  handler: async (input, client) => {
+    if (!input.product_name && !input.product_sku) {
+      throw new Error("Provide at least one of `product_name` or `product_sku`.");
+    }
+
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {};
+    if (input.status) queryParams.status = input.status;
+
+    const { items: allLeads, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodLead>(client, "/seller/leads", since, until, queryParams);
+
+    const nameLower = input.product_name?.trim().toLowerCase();
+    const skuLower = input.product_sku?.trim().toLowerCase();
+
+    const filtered = allLeads.filter((l) => {
+      const productsField = (l.products ?? "").toLowerCase();
+      if (nameLower && productsField.includes(nameLower)) return true;
+      if (skuLower && productsField.includes(skuLower)) return true;
+      return false;
+    });
+
+    const limit = input.limit ?? 500;
+    const rows = filtered.slice(0, limit).map((l) => ({
+      id: l.id,
+      status: l.status?.label,
+      products: l.products,
+      created_at: l.created_at,
+    }));
+
+    const agg = aggregateLeads(filtered);
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name, product_sku: input.product_sku, status: input.status },
+      total_matched: filtered.length,
+      returned_rows: rows.length,
+      summary: agg,
+      leads: rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  8. Export orders (compact flat format)                                     */
+/* -------------------------------------------------------------------------- */
+
+const exportOrders = tool({
+  name: "cod_export_orders",
+  description:
+    "Export orders as a compact flat array, similar to the CSV export on the dashboard. " +
+    "Supports product filter, status filter, field projection, and chunked pagination " +
+    "via `offset`/`chunk_size` so large result sets come back in controlled pages.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter orders containing this product (case-insensitive substring)."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by order status."),
+    fields: OrderFields,
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe("Skip this many orders (for chunked retrieval)."),
+    chunk_size: z
+      .number()
+      .int()
+      .min(1)
+      .max(2000)
+      .optional()
+      .default(500)
+      .describe("Max orders per chunk."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {
+      include: "items",
+    };
+    if (input.status) queryParams.status = input.status;
+
+    const { items: allOrders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, queryParams);
+
+    let orders = allOrders;
+    if (input.product_name) {
+      const needle = input.product_name.trim().toLowerCase();
+      orders = orders.filter((o) =>
+        orderProductNames(o).some((n) => n.toLowerCase().includes(needle)),
+      );
+    }
+
+    const offset = input.offset ?? 0;
+    const chunkSize = input.chunk_size ?? 500;
+    const chunk = orders.slice(offset, offset + chunkSize);
+
+    const rows = chunk.map((o) => {
+      const flat = flattenOrder(o);
+      return projectFields(flat as unknown as Record<string, unknown>, input.fields);
+    });
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name, status: input.status },
+      total_matched: orders.length,
+      offset,
+      chunk_size: chunkSize,
+      returned_rows: rows.length,
+      has_more: offset + chunkSize < orders.length,
+      next_offset: offset + chunkSize < orders.length ? offset + chunkSize : null,
+      orders: rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  9. Export leads (compact flat format)                                      */
+/* -------------------------------------------------------------------------- */
+
+const exportLeads = tool({
+  name: "cod_export_leads",
+  description:
+    "Export leads as a compact flat array. Supports product filter, status filter, " +
+    "and chunked pagination via `offset`/`chunk_size`.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter leads matching this product (case-insensitive substring on products field)."),
+    status: z
+      .string()
+      .optional()
+      .describe("Filter by lead status."),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .default(0)
+      .describe("Skip this many leads (for chunked retrieval)."),
+    chunk_size: z
+      .number()
+      .int()
+      .min(1)
+      .max(2000)
+      .optional()
+      .default(500)
+      .describe("Max leads per chunk."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const queryParams: Record<string, string | number | boolean | string[]> = {};
+    if (input.status) queryParams.status = input.status;
+
+    const { items: allLeads, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodLead>(client, "/seller/leads", since, until, queryParams);
+
+    let leads = allLeads;
+    if (input.product_name) {
+      const needle = input.product_name.trim().toLowerCase();
+      leads = leads.filter((l) => (l.products ?? "").toLowerCase().includes(needle));
+    }
+
+    const offset = input.offset ?? 0;
+    const chunkSize = input.chunk_size ?? 500;
+    const chunk = leads.slice(offset, offset + chunkSize);
+
+    const rows = chunk.map((l) => ({
+      id: l.id,
+      status: l.status?.label,
+      products: l.products,
+      created_at: l.created_at,
+    }));
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name, status: input.status },
+      total_matched: leads.length,
+      offset,
+      chunk_size: chunkSize,
+      returned_rows: rows.length,
+      has_more: offset + chunkSize < leads.length,
+      next_offset: offset + chunkSize < leads.length ? offset + chunkSize : null,
+      leads: rows,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  10. Per-product statistics (mirrors the Statistics page)                   */
+/* -------------------------------------------------------------------------- */
+
+const getStatistics = tool({
+  name: "cod_get_statistics",
+  description:
+    "Per-product statistics mirroring the Statistics page on the dashboard. For each " +
+    "product returns: leads total, leads confirmed, leads delivered, confirmation rate, " +
+    "delivery rate, orders shipped, orders delivered, order delivery rate. " +
+    "One call replaces scrolling through the Statistics page.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 1 year ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    product_names: z
+      .array(z.string())
+      .optional()
+      .describe("Limit to these products (case-insensitive substring). Omit to get all."),
+    include_cod_drop: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include COD Drop products in the results."),
+  }),
+  handler: async (input, client) => {
+    const since = toUtcStamp(input.since ?? defaultSince());
+    const until = toUtcStamp(input.until ?? new Date().toISOString());
+
+    const [ordersResult, leadsResult] = await Promise.all([
+      paginateInRange<CodOrder>(client, "/seller/orders", since, until, { include: "items" }),
+      paginateInRange<CodLead>(client, "/seller/leads", since, until, {}),
+    ]);
+
+    const needles = input.product_names?.map((n) => n.trim().toLowerCase());
+
+    // Build per-product order stats
+    const orderStats = new Map<
+      string,
+      { shipped: number; delivered: number; total: number; total_qty: number; revenue_usd: number }
+    >();
+    for (const o of ordersResult.items) {
+      for (const name of orderProductNames(o)) {
+        if (needles && !needles.some((n) => name.toLowerCase().includes(n))) continue;
+        const e = orderStats.get(name) ?? {
+          shipped: 0,
+          delivered: 0,
+          total: 0,
+          total_qty: 0,
+          revenue_usd: 0,
+        };
+        e.total += 1;
+        e.total_qty += orderItemQty(o);
+        e.revenue_usd += o.total_usd ?? 0;
+        if (o.shipped_at || (o.status?.label ?? "").toLowerCase() === "shipped") e.shipped += 1;
+        if (o.delivered_at) e.delivered += 1;
+        orderStats.set(name, e);
+      }
+    }
+
+    // Build per-product lead stats
+    const leadStats = new Map<string, { total: number; confirmed: number; delivered: number }>();
+    for (const l of leadsResult.items) {
+      const statusLabel = (l.status?.label ?? "").toLowerCase();
+      for (const name of leadProductNames(l)) {
+        if (needles && !needles.some((n) => name.toLowerCase().includes(n))) continue;
+        const e = leadStats.get(name) ?? { total: 0, confirmed: 0, delivered: 0 };
+        e.total += 1;
+        if (statusLabel === "confirmed") e.confirmed += 1;
+        // "delivered" in the leads context means the corresponding order was delivered
+        leadStats.set(name, e);
+      }
+    }
+
+    // Merge: collect all product names from both
+    const allNames = new Set([...orderStats.keys(), ...leadStats.keys()]);
+    const rows = [...allNames]
+      .map((product) => {
+        const os = orderStats.get(product) ?? {
+          shipped: 0,
+          delivered: 0,
+          total: 0,
+          total_qty: 0,
+          revenue_usd: 0,
+        };
+        const ls = leadStats.get(product) ?? { total: 0, confirmed: 0, delivered: 0 };
+        return {
+          product,
+          leads: ls.total,
+          leads_confirmed: ls.confirmed,
+          leads_confirmation_rate_pct: ls.total > 0 ? round((ls.confirmed / ls.total) * 100, 1) : 0,
+          orders_total: os.total,
+          orders_shipped: os.shipped,
+          orders_delivered: os.delivered,
+          orders_delivery_rate_pct:
+            os.shipped > 0 ? round((os.delivered / os.shipped) * 100, 1) : 0,
+          total_qty: os.total_qty,
+          revenue_usd: round(os.revenue_usd),
+        };
+      })
+      .sort((a, b) => b.leads - a.leads);
+
+    return {
+      range: { since, until },
+      product_filter: input.product_names ?? null,
+      total_products: rows.length,
+      rows,
+      orders_pages_scanned: ordersResult.pagesScanned,
+      leads_pages_scanned: leadsResult.pagesScanned,
+      orders_full_range: ordersResult.reachedCutoff,
+      leads_full_range: leadsResult.reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  11. Delivered dashboard (financial metrics)                               */
+/* -------------------------------------------------------------------------- */
+
+const getDeliveredDashboard = tool({
+  name: "cod_get_delivered_dashboard",
+  description:
+    "Mirrors the Delivered Dashboard on the seller portal. Returns financial and " +
+    "delivery metrics: shipped/processing/delivered/returned orders, profits, " +
+    "shipping cost, delivery cost, fees, and revenue. Supports product and country filters.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 30 days ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter orders containing this product (case-insensitive substring)."),
+    country: z
+      .string()
+      .optional()
+      .describe("Filter by customer country name (case-insensitive substring)."),
+  }),
+  handler: async (input, client) => {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const since = toUtcStamp(input.since ?? thirtyDaysAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const { items: allOrders, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodOrder>(client, "/seller/orders", since, until, { include: "items" });
+
+    let orders = allOrders;
+    if (input.product_name) {
+      const needle = input.product_name.trim().toLowerCase();
+      orders = orders.filter((o) =>
+        orderProductNames(o).some((n) => n.toLowerCase().includes(needle)),
+      );
+    }
+    if (input.country) {
+      const needle = input.country.trim().toLowerCase();
+      orders = orders.filter(
+        (o) => (o.customer_country_name ?? "").toLowerCase().includes(needle),
+      );
+    }
+
+    let shipped = 0;
+    let processing = 0;
+    let delivered = 0;
+    let returned = 0;
+    let totalRevenue = 0;
+    let deliveredRevenue = 0;
+    let returnedRevenue = 0;
+    let totalQty = 0;
+
+    for (const o of orders) {
+      const statusLabel = (o.status?.label ?? "").toLowerCase();
+      if (o.shipped_at || statusLabel === "shipped") shipped += 1;
+      if (statusLabel === "processing" || statusLabel === "assigned") processing += 1;
+      if (o.delivered_at) {
+        delivered += 1;
+        deliveredRevenue += o.total_usd ?? 0;
+      }
+      if (o.returned_at) {
+        returned += 1;
+        returnedRevenue += o.total_usd ?? 0;
+      }
+      totalRevenue += o.total_usd ?? 0;
+      totalQty += orderItemQty(o);
+    }
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name, country: input.country },
+      total_orders: orders.length,
+      shipped_orders: shipped,
+      processing_orders: processing,
+      delivered_orders: delivered,
+      returned_orders: returned,
+      delivery_rate_pct: shipped > 0 ? round((delivered / shipped) * 100, 1) : 0,
+      total_quantity: totalQty,
+      total_revenue_usd: round(totalRevenue),
+      delivered_revenue_usd: round(deliveredRevenue),
+      returned_revenue_usd: round(returnedRevenue),
+      net_revenue_usd: round(deliveredRevenue - returnedRevenue),
+      by_status: bucketBy(orders, (o) => o.status?.label),
+      by_country: bucketBy(orders, (o) => o.customer_country_name),
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
+/* -------------------------------------------------------------------------- */
+/*  12. Confirmed dashboard (lead confirmation metrics)                       */
+/* -------------------------------------------------------------------------- */
+
+const getConfirmedDashboard = tool({
+  name: "cod_get_confirmed_dashboard",
+  description:
+    "Mirrors the Confirmed Dashboard on the seller portal. Returns lead counts by " +
+    "status (new, confirmed, cancelled, processing, no-reply, wrong, expired, etc.) " +
+    "with confirmation rate. Supports product and country filters.",
+  inputSchema: z.object({
+    since: z
+      .string()
+      .optional()
+      .describe("Start of range (YYYY-MM-DD). Defaults to 30 days ago."),
+    until: z
+      .string()
+      .optional()
+      .describe("End of range (exclusive). Defaults to now."),
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter leads matching this product (case-insensitive substring on products field)."),
+  }),
+  handler: async (input, client) => {
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const since = toUtcStamp(input.since ?? thirtyDaysAgo.toISOString());
+    const until = toUtcStamp(input.until ?? now.toISOString());
+
+    const { items: allLeads, pagesScanned, reachedCutoff } =
+      await paginateInRange<CodLead>(client, "/seller/leads", since, until, {});
+
+    let leads = allLeads;
+    if (input.product_name) {
+      const needle = input.product_name.trim().toLowerCase();
+      leads = leads.filter((l) => (l.products ?? "").toLowerCase().includes(needle));
+    }
+
+    const agg = aggregateLeads(leads);
+
+    return {
+      range: { since, until },
+      filter: { product_name: input.product_name },
+      total_leads: leads.length,
+      ...agg,
+      pages_scanned: pagesScanned,
+      full_range_covered: reachedCutoff,
+    };
+  },
+});
+
 /* -------------------------------------------------------------------------- */
 
 export const tools: ReadonlyArray<ToolDef> = [
+  // ── existing tools (untouched) ──
   listProducts,
   getProduct,
   getProductBySku,
@@ -1338,4 +2597,17 @@ export const tools: ReadonlyArray<ToolDef> = [
   getLeadCounts,
   getOrderTracking,
   rawRequest,
+  // ── v2 tools ──
+  discoverContext,
+  getProductCatalog,
+  getOrdersBulk,
+  aggregateByCity,
+  aggregateOrdersGeneric,
+  aggregateLeadsGeneric,
+  getLeadsByProduct,
+  exportOrders,
+  exportLeads,
+  getStatistics,
+  getDeliveredDashboard,
+  getConfirmedDashboard,
 ];
